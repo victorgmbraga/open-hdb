@@ -94,6 +94,13 @@ def android_public_key(path: Path) -> bytes:
 
 
 def encoded_public_key(path: Path, identity: str | None = None) -> bytes:
-    """Formato que o dispositivo grava em ``hdb_keys``: ``base64 blob user@host``."""
+    """Formato que o dispositivo grava em ``hdb_keys``: ``base64 blob user@host``.
+
+    ``identity=""`` devolve só o base64 (o hdbd aceita; o framework então grava
+    uma linha sem identidade, que parece ser o formato que ele consegue reler).
+    """
+    blob = base64.b64encode(android_public_key(path))
+    if identity == "":
+        return blob
     identity = identity or f"open-hdb@{socket.gethostname()}"
-    return base64.b64encode(android_public_key(path)) + b" " + identity.encode()
+    return blob + b" " + identity.encode()
