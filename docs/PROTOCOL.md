@@ -85,6 +85,17 @@ Evidências (endereços no binário do KOB2-W09):
 | `send_packet` @0x57fd1 | `ldr r0,[r5,#0xc]; mvns r0,r0; str r0,[r5,#0x20]` e `str r0,[r5,#0x1c]` (checksum) |
 | `handle_packet` @0x50659 | lê comando de `[r4,#0xc]`, compara com `0x48545541` (A_AUTH) e `0x4e45504f` (A_OPEN), payload em `r4+0x24` |
 | `check_data` @0x59575 | compara `calculate_apacket_checksum` com `[r4,#0x1c]` |
+| `calculate_apacket_checksum` @0x4fa59 | **soma de bytes** (`ldrb; add; bne`), não CRC32 |
+| `get_apacket` @0x4fa75 | `malloc(36 + 0x80000)`, zera 0x00–0x2f → payload máx. **512 KB** |
+| `send_connect` @0x4fe35 | `get_apacket`; `str cmd,[r5,#0xc]`; arg0 `[r5,#0x10]`; arg1 `[r5,#0x14]`; banner em `r5+0x24`; `str len,[r5,#0x18]` — **nada em 0x00–0x0b** |
+
+Caminhos usados pela função USB (FunctionFS):
+
+```
+/dev/usb-ffs/hdb/ep0   (controle)
+/dev/usb-ffs/hdb/ep1   (bulk)
+/dev/usb-ffs/hdb/ep2   (bulk)
+```
 
 Implementação: `openhdb/protocol_hdb.py` (`HdbMessage`), com testes em
 `tests/test_protocol.py`.
@@ -102,9 +113,11 @@ Implementação: `openhdb/protocol_hdb.py` (`HdbMessage`), com testes em
 | escrita em 2 partes (4B, depois 36B) | EIO + re-enumeração |
 | **ler a interface nova após a re-enumeração** | timeout — não há resposta pendente |
 
-Detalhe importante: nos últimos testes o `write` foi **aceito** e o `EIO` veio da
-`read` — é o handle antigo morrendo com a re-enumeração, não uma rejeição do
-write. Mesmo assim, a interface nova não traz dados, então a sessão não continua.
+Detalhe importante: o `write` é **aceito** e o erro aparece na `read`
+(`EIO`/`ENODEV`) — o USB re-enumera, mas o `hdbd` **não crasha** (pid estável).
+A interface nova não traz dados, então a sessão não continua. Falta descobrir o
+que o `hdbd` espera antes do primeiro quadro (tamanho de leitura? passo de
+inicialização?) — próximo passo dinâmico: *usbmon* de uma sessão real.
 
 Conclusão: o `hdbd` rejeita o quadro antes de qualquer autenticação — falta
 descobrir a semântica do prefixo de 4 bytes (ou um passo de inicialização

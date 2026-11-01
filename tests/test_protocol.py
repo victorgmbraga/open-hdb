@@ -54,6 +54,7 @@ def test_hdb_header_layout():
 
 def test_hdb_roundtrip_e_checksum():
     out, used = H.decode(H.HdbMessage(P.A_WRTE, 1, 2, b"abc").encode())
+    assert H.HdbMessage(P.A_WRTE, 1, 2, b"abc").checksum() == sum(b"abc")
     assert (out.command, out.arg0, out.arg1, out.data) == (P.A_WRTE, 1, 2, b"abc")
     assert used == 4 + 36 + 3
 

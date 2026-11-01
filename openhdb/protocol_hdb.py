@@ -11,7 +11,7 @@ Layout reconstruído de ``check_header``/``send_packet``/``handle_packet``
     0x10    4        arg0
     0x14    4        arg1
     0x18    4        data_length
-    0x1c    4        data_check  (check_data compara com calculate_apacket_checksum)
+    0x1c    4        data_check  (soma dos bytes; ver calculate_apacket_checksum)
     0x20    4        magic       (= ~command; check_header valida)
     0x24    ...      data
 
@@ -34,7 +34,6 @@ o valor correto ainda não foi identificado (ver docs/PROTOCOL.md §8).
 from __future__ import annotations
 
 import struct
-import zlib
 from dataclasses import dataclass
 
 HDR_SIZE = 0x24  # 36 bytes
@@ -56,13 +55,17 @@ class HdbMessage:
     data: bytes = b""
     prefix: int = 0
 
+    def checksum(self) -> int:
+        """``calculate_apacket_checksum``: soma dos bytes (não CRC32!)."""
+        return sum(self.data) & 0xFFFFFFFF
+
     def encode(self) -> bytes:
         header = bytearray(HDR_SIZE)
         struct.pack_into("<I", header, _CMD, self.command)
         struct.pack_into("<I", header, _ARG0, self.arg0)
         struct.pack_into("<I", header, _ARG1, self.arg1)
         struct.pack_into("<I", header, _LEN, len(self.data))
-        struct.pack_into("<I", header, _CHECK, zlib.crc32(self.data) & 0xFFFFFFFF if self.data else 0)
+        struct.pack_into("<I", header, _CHECK, self.checksum())
         struct.pack_into("<I", header, _MAGIC, (~self.command) & 0xFFFFFFFF)
         return struct.pack("<I", self.prefix) + bytes(header) + self.data
 
@@ -84,6 +87,6 @@ def decode(raw: bytes) -> tuple[HdbMessage, int]:
     data = raw[base + HDR_SIZE : base + HDR_SIZE + length]
     if len(data) != length:
         raise ValueError(f"dados incompletos: {len(data)} de {length}")
-    if data and (zlib.crc32(data) & 0xFFFFFFFF) != check:
+    if data and (sum(data) & 0xFFFFFFFF) != check:
         raise ValueError("checksum inválido")
     return HdbMessage(command, arg0, arg1, data, prefix), base + HDR_SIZE + length
