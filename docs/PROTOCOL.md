@@ -179,6 +179,22 @@ Detalhes confirmados na prática:
 
 Estado atual do cliente: **conecta e recebe o banner** (testado várias vezes).
 
+### Serviço de controle: `hwUsbExService` (IHwUsbManagerEx)
+
+Descoberto no aparelho e **mapeado por experimento** (`service call`):
+
+| código | método | efeito observado |
+|---|---|---|
+| 1 | `allowUsbHDB` | aprova a chave (espera fingerprint: `Got , expected 6D:6E:...`) |
+| 2 | `denyUsbHDB` | nega |
+| 3 | `clearUsbHDBKeys` | `deleteKeyFile success ? true` — apaga o `hdb_keys` |
+| 4 | `setHdbEnabled` | liga/desliga o HDB |
+
+```bash
+adb shell service call hwUsbExService 3 s16 x    # limpa o store de chaves
+adb shell service call hwUsbExService 4 i32 1    # HDB on
+```
+
 ### Instabilidade conhecida: `hdb_keys` corrompido
 
 O framework (`HwUsbHDBManager.writeKey`) grava `/data/misc/adb/hdb_keys` com uma

@@ -152,19 +152,20 @@ class HdbConnection:
                 raise ConnectionError_("dispositivo exigiu TLS (A_STLS), não suportado")
         raise ConnectionError_("timeout esperando A_CNXN do dispositivo")
 
-    def _settle_auth(self, grace: float = 3.0) -> None:
-        """Continua respondendo A_AUTH até o dispositivo parar de pedir."""
+    def _settle_auth(self, grace: float = 3.0, max_total: float = 6.0) -> None:
+        """Responde A_AUTH por no máximo ``grace`` (teto rígido ``max_total``)."""
         import time as _t
 
-        end = _t.monotonic() + grace
-        while _t.monotonic() < end:
+        start = _t.monotonic()
+        end = start + grace
+        while _t.monotonic() < end and _t.monotonic() - start < max_total:
             try:
                 msg = self.recv(timeout=0.5)
             except TransportError:
                 continue
             if msg.command == protocol.A_AUTH:
                 self._handle_auth(msg, self._key_sent)
-                end = _t.monotonic() + 1.0  # estende enquanto houver pedido
+                end = min(_t.monotonic() + 1.0, start + max_total)
 
     def _handle_auth(self, msg: Message, already_sent_key: bool) -> None:
         if msg.arg0 == protocol.AUTH_TOKEN:
