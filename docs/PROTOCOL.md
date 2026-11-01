@@ -58,7 +58,9 @@ Constantes (valores do ADB, herdados pelo fork):
 
 (Os valores são o ASCII — `"CNXN"`, `"OPEN"`... — lido como `uint32` little-endian.)
 
-## 2.1 Cabeçalho real do HDB: 36 bytes (não 24)
+## 2.1 (histórico) Struct interna de 36 bytes
+
+> Superado por §2.1 abaixo: no fio vão apenas 24 bytes. Mantido como registro.
 
 Desmontando `hdbd` (Thumb, símbolos não removidos) o layout do `apacket` do HDB
 é **maior** que o do adb:
@@ -122,6 +124,61 @@ inicialização?) — próximo passo dinâmico: *usbmon* de uma sessão real.
 Conclusão: o `hdbd` rejeita o quadro antes de qualquer autenticação — falta
 descobrir a semântica do prefixo de 4 bytes (ou um passo de inicialização
 anterior a ele).
+
+## 2.1 Formato no fio: cabeçalho de **24 bytes** (igual ao adb)
+
+A struct interna do `hdbd` tem 36 bytes, mas só **24 vão pelo fio**. Prova, em
+`remote_read` @0x5b4c4:
+
+```
+movs r2, #0x18          ; lê 24 bytes
+add.w r1, r4, #0xc      ; grava em packet+0x0c
+bl   usb_read
+...
+ldr  r2, [r4, #0x18]    ; data_length
+add.w r1, r4, #0x24     ; buffer de dados = packet+0x24
+bl   usb_read
+```
+
+Ou seja: os 12 primeiros bytes da struct são internos (fora do fio) e o
+cabeçalho transmitido é o `amessage` clássico:
+
+| offset no fio | campo |
+|---|---|
+| 0x00 | command |
+| 0x04 | arg0 |
+| 0x08 | arg1 |
+| 0x0c | data_length |
+| 0x10 | data_check |
+| 0x14 | magic (= ~command) |
+
+**A única diferença em relação ao adb é o checksum**: `calculate_apacket_checksum`
+@0x4fa59 soma os bytes (`ldrb; add; bne`), em vez de CRC32.
+
+## 2.2 Handshake verificado (funciona!)
+
+```
+host   -> device : A_CNXN  arg0=A_VERSION  arg1=max_payload  "host::features=..."
+device -> host   : A_AUTH  arg0=TOKEN(1)  + nonce de 20 bytes
+host   -> device : A_AUTH  arg0=SIGNATURE(2)  (PKCS#1 v1.5 / SHA-1, 256 bytes)
+device -> host   : A_AUTH  arg0=RSAPUBLICKEY(3)   [quando a chave não é conhecida]
+host   -> device : A_AUTH  arg0=RSAPUBLICKEY(3)  base64(blob) + " user@host" + NUL
+device           : mostra HwUsbDebuggingActivity ("Permitir conexão via HDB?")
+                   grava a chave em /data/misc/adb/hdb_keys
+device -> host   : A_CNXN  banner "device::ro.product.name=KOB2-W09;...;features=stat_v2,cmd,shell_v2"
+```
+
+Detalhes confirmados na prática:
+
+- o payload da chave pública **precisa terminar em `\0`** — sem isso o `hdbd`
+  responde `Key must be a null-terminated string` e o framework grava uma linha
+  vazia em `hdb_keys` (que depois falha com `Invalid base64 key`);
+- o banner é `device::...` (não `hdb::`);
+- a versão anunciada pelo aparelho é `0x01000000` e `max_payload=262144`;
+- features: `stat_v2, cmd, shell_v2`.
+
+Estado atual do cliente: **conecta e recebe o banner** (testado), inclusive sem
+prompt depois que a chave é aceita. O stream de shell ainda não abre — ver §8.
 
 ## 3. Banner
 
@@ -256,8 +313,9 @@ Interface do HDB **a identificar** — o `probe` reporta todas as interfaces com
 ## 7. Aberto
 
 - [x] qual interface USB pertence ao `hdbd` (itf ff/48/01, ep 04/85)
-- [ ] semântica do prefixo de 4 bytes do quadro HDB
-- [ ] **capturar uma sessão real do HiSuite com usbmon** (caminho decisivo)
+- [x] framing no fio: 24 bytes, checksum = soma de bytes
+- [ ] nome do serviço de shell no HDB ("shell:" não existe no binário; testar "shell" puro)
+- [ ] por que `/data/misc/adb/hdb_keys` fica com linha inválida (bug do framework)
 - [ ] formato das mensagens `HDB AUTHENTIC*` (texto puro? A_AUTH com payload?)
 - [ ] se o handshake do HDB começa com um magic/hello diferente de A_CNXN
 - [ ] valor do tipo no banner (`hdb` vs `device`) e lista de features (o HDB não aceita CNXN, logo o banner vem por outro caminho)

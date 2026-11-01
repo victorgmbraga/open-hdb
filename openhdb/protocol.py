@@ -72,9 +72,17 @@ class Message:
     def name(self) -> str:
         return COMMAND_NAMES.get(self.command, f"0x{self.command:08X}")
 
-    def encode(self) -> tuple[bytes, bytes]:
-        """Retorna (cabeçalho, dados) prontos para escrita no transporte."""
-        crc = zlib.crc32(self.data) & 0xFFFFFFFF if self.data else 0
+    def encode(self, checksum: str = "crc32") -> tuple[bytes, bytes]:
+        """Retorna (cabeçalho, dados) prontos para escrita no transporte.
+
+        ``checksum``:
+          - ``"crc32"``: adb clássico
+          - ``"sum"``:   HDB (``calculate_apacket_checksum`` soma os bytes)
+        """
+        if checksum == "sum":
+            crc = sum(self.data) & 0xFFFFFFFF if self.data else 0
+        else:
+            crc = zlib.crc32(self.data) & 0xFFFFFFFF if self.data else 0
         header = HEADER.pack(
             self.command,
             self.arg0,

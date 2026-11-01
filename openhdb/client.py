@@ -59,7 +59,7 @@ def probe(timeout: float = 3.0, verbose: bool = False) -> list[ProbeResult]:
 
 
 def connect(interface: Interface | None = None, key_path: Path | None = None,
-            verbose: bool = False) -> HdbConnection:
+            verbose: bool = False, auth_timeout: float = 20.0) -> HdbConnection:
     """Conecta e autentica na primeira interface que responder, ou na indicada."""
     candidates = [interface] if interface else find_interfaces()
     if not candidates:
@@ -71,9 +71,11 @@ def connect(interface: Interface | None = None, key_path: Path | None = None,
         except Exception as exc:
             last = exc
             continue
-        conn = HdbConnection(transport, key_path=key_path, verbose=verbose)
+        from .usb import HDB_SUBCLASS
+        mode = "sum" if intf.intf.bInterfaceSubClass == HDB_SUBCLASS else "crc32"
+        conn = HdbConnection(transport, key_path=key_path, verbose=verbose, checksum=mode)
         try:
-            conn.connect()
+            conn.connect(timeout=auth_timeout)
             return conn
         except Exception as exc:
             last = exc

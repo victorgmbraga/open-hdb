@@ -71,8 +71,10 @@ class Stream:
 class HdbConnection:
     """Conecta, autentica e multiplexa streams sobre um transporte USB."""
 
-    def __init__(self, transport: UsbTransport, key_path: Path | None = None, verbose: bool = False):
+    def __init__(self, transport: UsbTransport, key_path: Path | None = None, verbose: bool = False,
+                 checksum: str = "crc32"):
         self.transport = transport
+        self.checksum = checksum
         self.key_path = auth.ensure_key(key_path or auth.DEFAULT_KEY)
         self.verbose = verbose
         self.banner: str | None = None
@@ -81,6 +83,8 @@ class HdbConnection:
         self.max_payload: int = protocol.MAX_PAYLOAD
         self.online = False
         self.kind: str | None = None
+        self._tokens = 0
+        self._key_sent = False
         self._next_id = 1
         self._streams: dict[int, Stream] = {}
         self._log: list[Message] = []
@@ -93,7 +97,8 @@ class HdbConnection:
 
     def send(self, msg: Message) -> None:
         self._trace(">>", msg)
-        self.transport.send(msg)
+        header, data = msg.encode(checksum=self.checksum)
+        self.transport.send_raw(header, data)
 
     def recv(self, timeout: float = 2.0) -> Message:
         msg = self.transport.recv(int(timeout * 1000))
@@ -113,8 +118,23 @@ class HdbConnection:
         )
         deadline = time.monotonic() + timeout
         sent_key = False
+        last_cnxn = time.monotonic()
         while time.monotonic() < deadline:
-            msg = self.recv(timeout=min(3.0, max(0.2, deadline - time.monotonic())))
+            # reenvia CNXN a cada 5 s: força o hdbd a recarregar as chaves
+            if time.monotonic() - last_cnxn > 5.0 and not self.online:
+                self.send(
+                    Message(
+                        protocol.A_CNXN,
+                        protocol.A_VERSION,
+                        protocol.MAX_PAYLOAD,
+                        protocol.make_banner("host", HOST_FEATURES).encode(),
+                    )
+                )
+                last_cnxn = time.monotonic()
+            try:
+                msg = self.recv(timeout=min(3.0, max(0.2, deadline - time.monotonic())))
+            except TransportError:
+                continue  # timeout: segue tentando (e reenvia CNXN)
             if msg.command == protocol.A_CNXN:
                 self.banner = msg.data.decode(errors="replace")
                 self.kind, self.features = protocol.parse_banner(self.banner)
@@ -131,6 +151,14 @@ class HdbConnection:
 
     def _handle_auth(self, msg: Message, already_sent_key: bool) -> None:
         if msg.arg0 == protocol.AUTH_TOKEN:
+            self._tokens += 1
+            # 1a tentativa: assinatura. Se o dispositivo recusar (reenvia TOKEN),
+            # registramos a chave pública — é o fluxo que o HiSuite usa.
+            if self._tokens >= 2 and not self._key_sent:
+                key = auth.encoded_public_key(self.key_path)
+                self._key_sent = True
+                self.send(Message(protocol.A_AUTH, protocol.AUTH_RSAPUBLICKEY, 0, key + b"\0"))
+                return
             signature = auth.sign_token(self.key_path, msg.data[:20])
             self.send(Message(protocol.A_AUTH, protocol.AUTH_SIGNATURE, 0, signature))
             return
@@ -193,6 +221,12 @@ class HdbConnection:
             if stream.closed:
                 return
         raise ConnectionError_("timeout esperando A_OKAY de escrita")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     def close(self) -> None:
         for stream in list(self._streams.values()):

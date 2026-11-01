@@ -7,8 +7,9 @@ engenharia reversa do `hdbd` do dispositivo — sem HiSuite, sem Windows.
 > - ✅ framing de pacotes (validado contra o `adbd` real: recebemos `A_AUTH/TOKEN`)
 > - ✅ transporte USB, descoberta de interfaces, `probe`/`banner`/`shell`
 > - ✅ descoberta da interface HDB (`ff/48/01`, ep `04`/`85`)
-> - ⚠️ handshake do HDB: pendente — `A_CNXN` faz o dispositivo re-enumerar;
->   o HDB usa o vocabulário `HDB AUTHENTIC*` (ver docs/PROTOCOL.md §3.1)
+> - ✅ **handshake completo do HDB**: autentica (RSA + diálogo de autorização) e
+>   recebe o banner real do aparelho (`device::ro.product.name=KOB2-W09;...`)
+> - ⏳ stream de shell (nome do serviço diferente de `shell:`)
 > - ✅ **cabeçalho real do HDB decodificado: 36 bytes** (`openhdb/protocol_hdb.py`)
 > - ⏳ `install` pelo caminho `pm install --hwhdb`
 >

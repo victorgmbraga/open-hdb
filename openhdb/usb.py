@@ -97,6 +97,10 @@ class UsbTransport:
     # -- I/O ----------------------------------------------------------------
     def send(self, msg: Message) -> None:
         header, data = msg.encode()
+        self.send_raw(header, data)
+
+    def send_raw(self, header: bytes, data: bytes = b"") -> None:
+        """Escreve cabeçalho e dados (transferências separadas, como o adbd)."""
         self._ep_out.write(header, timeout=self.timeout_ms)
         if data:
             self._ep_out.write(data, timeout=self.timeout_ms)
