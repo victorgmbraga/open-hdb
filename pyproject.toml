@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-hdb"
+version = "0.1.0"
+description = "Cliente HDB (Huawei Debug Bridge) aberto, derivado de engenharia reversa do hdbd"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = ["pyusb>=1.2"]
+
+[project.scripts]
+openhdb = "openhdb.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
