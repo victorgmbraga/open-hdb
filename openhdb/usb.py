@@ -70,7 +70,22 @@ class UsbTransport:
     def open(self) -> "UsbTransport":
         dev = self.dev
         cfg = self.interface.config
-        usb.util.claim_interface(dev, self.interface.number)
+        # se o kernel tiver um driver preso na interface (usbserial/option),
+        # o claim falha com EBUSY: tenta desanexar antes.
+        for detach in (
+            lambda: dev.is_kernel_driver_active(self.interface.number) and dev.detach_kernel_driver(self.interface.number),
+            lambda: dev.detach_kernel_driver(self.interface.number),
+            lambda: usb.util.dispose_resources(dev),
+        ):
+            try:
+                detach()
+                break
+            except Exception:
+                continue
+        try:
+            usb.util.claim_interface(dev, self.interface.number)
+        except usb.core.USBError as exc:
+            raise TransportError(f"claim falhou na interface {self.interface.number}: {exc}") from exc
         self._claimed = True
         for ep in self.interface.intf:
             if ep.bEndpointAddress & 0x80:
@@ -145,6 +160,8 @@ def find_interfaces(vids=KNOWN_VIDS) -> list[Interface]:
                 and intf.bInterfaceProtocol == PROTOCOL
             ):
                 found.append(Interface(dev, cfg, intf))
+    # HDB (0x48) primeiro: é o alvo deste cliente; ADB (0x42) como alternativa
+    found.sort(key=lambda i: 0 if i.intf.bInterfaceSubClass == HDB_SUBCLASS else 1)
     return found
 
 

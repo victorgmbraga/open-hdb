@@ -177,8 +177,34 @@ Detalhes confirmados na prática:
 - a versão anunciada pelo aparelho é `0x01000000` e `max_payload=262144`;
 - features: `stat_v2, cmd, shell_v2`.
 
-Estado atual do cliente: **conecta e recebe o banner** (testado), inclusive sem
-prompt depois que a chave é aceita. O stream de shell ainda não abre — ver §8.
+Estado atual do cliente: **conecta e recebe o banner** (testado várias vezes).
+
+### Instabilidade conhecida: `hdb_keys` corrompido
+
+O framework (`HwUsbHDBManager.writeKey`) grava `/data/misc/adb/hdb_keys` com uma
+linha inválida — o `hdbd` registra em toda tentativa:
+
+```
+I hdbd: Loading keys from /data/misc/adb/hdb_keys
+E hdbd: Invalid base64 key  in /data/misc/adb/hdb_keys
+```
+
+Consequência: a chave só vale **em memória**, na janela logo após a aprovação
+(`allowUsbHDB`). Sessões seguintes voltam ao ciclo TOKEN/SIGNATURE e o `A_OPEN`
+é ignorado. Limpar esse arquivo exige root (ou apagar via framework numa build
+que não tenha o bug).
+
+### Fluxo de auth no tempo
+
+```
+host: CNXN ──────────────────────────────┐
+device: AUTH TOKEN                       │  o hdbd manda o banner ANTES de
+host: AUTH SIGNATURE                     │  terminar a auth; é preciso
+device: AUTH RSAPUBLICKEY (se nova)      │  continuar respondendo TOKENs
+host: AUTH RSAPUBLICKEY + NUL            │  (implementado em _settle_auth)
+device: (framework) HwUsbDebuggingActivity → allowUsbHDB
+device: CNXN banner "device::..."        │
+```
 
 ## 3. Banner
 

@@ -140,6 +140,9 @@ class HdbConnection:
                 self.kind, self.features = protocol.parse_banner(self.banner)
                 self.version, self.max_payload = msg.arg0, msg.arg1 or protocol.MAX_PAYLOAD
                 self.online = True
+                # o hdbd manda o banner antes de terminar a auth: responde os
+                # TOKENs por um tempo curto antes de liberar a conexão
+                self._settle_auth(grace=8.0)
                 return self.banner
             if msg.command == protocol.A_AUTH:
                 self._handle_auth(msg, sent_key)
@@ -148,6 +151,20 @@ class HdbConnection:
             if msg.command == protocol.A_STLS:
                 raise ConnectionError_("dispositivo exigiu TLS (A_STLS), não suportado")
         raise ConnectionError_("timeout esperando A_CNXN do dispositivo")
+
+    def _settle_auth(self, grace: float = 3.0) -> None:
+        """Continua respondendo A_AUTH até o dispositivo parar de pedir."""
+        import time as _t
+
+        end = _t.monotonic() + grace
+        while _t.monotonic() < end:
+            try:
+                msg = self.recv(timeout=0.5)
+            except TransportError:
+                continue
+            if msg.command == protocol.A_AUTH:
+                self._handle_auth(msg, self._key_sent)
+                end = _t.monotonic() + 1.0  # estende enquanto houver pedido
 
     def _handle_auth(self, msg: Message, already_sent_key: bool) -> None:
         if msg.arg0 == protocol.AUTH_TOKEN:
@@ -174,7 +191,18 @@ class HdbConnection:
         raise ConnectionError_(f"A_AUTH desconhecido: arg0={msg.arg0}")
 
     # -- streams ------------------------------------------------------------
-    def open(self, service: str, timeout: float = 5.0) -> Stream:
+    def open(self, service: str, timeout: float = 5.0, retries: int = 4) -> Stream:
+        """Abre um stream; reenvia o A_OPEN se o dispositivo ainda estiver em auth."""
+        last: Exception | None = None
+        for attempt in range(retries):
+            try:
+                return self._open_once(service, timeout)
+            except TransportError as exc:
+                last = exc
+                self._settle_auth(grace=1.5)
+        raise last or TransportError("não consegui abrir o stream")
+
+    def _open_once(self, service: str, timeout: float = 5.0) -> Stream:
         local_id = self._next_id
         self._next_id += 1
         stream = Stream(self, local_id)
@@ -189,7 +217,11 @@ class HdbConnection:
         raise ConnectionError_(f"timeout abrindo stream {service!r}")
 
     def dispatch(self, msg: Message) -> bool:
-        """Roteia a mensagem para o stream certo. Retorna True se era de um stream."""
+        """Roteia a mensagem. Retorna True se consumiu (stream ou auth)."""
+        if msg.command == protocol.A_AUTH:
+            # o hdbd continua pedindo TOKEN depois do CNXN; responder é obrigatório
+            self._handle_auth(msg, self._key_sent)
+            return True
         if msg.command == protocol.A_OKAY:
             stream = self._streams.get(msg.arg1)
             if stream is not None:
