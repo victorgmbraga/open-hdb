@@ -15,7 +15,7 @@ import struct
 import sys
 
 from capstone import CS_ARCH_ARM, CS_MODE_ARM, CS_MODE_THUMB, Cs
-from capstone.arm import ARM_OP_IMM, ARM_OP_MEM, ARM_OP_REG
+from capstone.arm import ARM_OP_IMM, ARM_OP_MEM, ARM_REG_PC
 from elftools.elf.elffile import ELFFile
 
 
@@ -77,12 +77,7 @@ def annotate_literals(elf: Elf, insns) -> dict:
         if ins.mnemonic != "ldr" or len(ins.operands) != 2:
             continue
         mem = ins.operands[1]
-        if mem.type != ARM_OP_MEM or mem.mem.base == 0:  # pc == 0? não; ver abaixo
-            pass
-        if mem.type != ARM_OP_MEM:
-            continue
-        # PC-relative: base é o registrador PC (ARM_REG_PC)
-        if mem.mem.base != 15:  # ARM_REG_PC == 15
+        if mem.type != ARM_OP_MEM or mem.mem.base != ARM_REG_PC:
             continue
         target = (ins.address + 4) & ~3
         target += mem.mem.disp
@@ -91,8 +86,31 @@ def annotate_literals(elf: Elf, insns) -> dict:
             continue
         ptr = struct.unpack("<I", raw)[0]
         text = elf.cstring(ptr)
-        if text:
-            notes[ins.address] = f'"{text[:70]}"'
+        notes[ins.address] = f'{ptr:#x}' + (f' "{text[:100]}"' if text else '')
+    # Android PIE uses relative literal values followed by `add rN, pc`.
+    literals = {}
+    for ins in insns:
+        if ins.mnemonic == "ldr" and len(ins.operands) == 2:
+            mem = ins.operands[1]
+            if mem.type == ARM_OP_MEM and mem.mem.base == ARM_REG_PC:
+                raw = elf.read(((ins.address + 4) & ~3) + mem.mem.disp, 4)
+                if len(raw) == 4:
+                    literals[ins.operands[0].reg] = struct.unpack("<I", raw)[0]
+                    continue
+        if ins.mnemonic == "add" and len(ins.operands) == 2 and ins.operands[1].reg == ARM_REG_PC:
+            reg = ins.operands[0].reg
+            if reg in literals:
+                ptr = (literals[reg] + ins.address + 4) & 0xFFFFFFFF
+                text = elf.cstring(ptr)
+                notes[ins.address] = f'{ptr:#x}' + (f' "{text[:100]}"' if text else '')
+        for reg in ins.regs_access()[1]:
+            literals.pop(reg, None)
+    symbols = {addr & ~1: name for name, addr in elf.symbols()}
+    for ins in insns:
+        if ins.mnemonic in ("bl", "blx") and ins.operands[0].type == ARM_OP_IMM:
+            target = ins.operands[0].imm & ~1
+            if target in symbols:
+                notes[ins.address] = symbols[target]
     return notes
 
 

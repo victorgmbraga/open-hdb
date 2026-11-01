@@ -1,366 +1,273 @@
-# Protocolo HDB — notas de engenharia reversa
+# HDB protocol — evidence and open questions
 
-Este documento registra o que foi **verificado** no `hdbd` (KOB2-W09,
-`10.1.0.212(C605E2R1P2)`, Android 10) e o que ainda é hipótese.
+Target: Huawei MatePad T8 KOB2-W09, Android 10,
+`10.1.0.212(C605E2R1P2)`. Addresses below refer to the stock ARM32/Thumb `hdbd`
+analysed locally; that proprietary binary is **not** in this repository.
+Thumb symbol values include bit 0; instruction addresses below clear it.
+Binary SHA-256: `832d7cc1e8bfb2bd79d35dd4538af353f988aca86b69adf98365c61bd455c031`.
 
-## 1. Parentesco com o ADB
+This replaces the initial, contradictory research notes. Claims are separated
+into **device-tested**, **static analysis**, and **not yet verified**.
 
-`hdbd` é um fork do `adbd`. Evidências diretas no binário:
+## 1. USB and framing — device-tested and statically confirmed
 
-```
-vendor/huawei/chipset_common/modules/hwusb/hdb/adb.cpp
-vendor/huawei/chipset_common/modules/hwusb/hdb/adb_io.cpp
-vendor/huawei/chipset_common/modules/hwusb/hdb/adb_trace.cpp
-vendor/huawei/chipset_common/modules/hwusb/hdb/adb_utils.cpp
-vendor/huawei/chipset_common/modules/hwusb/hdb/daemon/main.cpp
-vendor/huawei/chipset_common/modules/hwusb/hdb/daemon/usb.cpp
-vendor/huawei/chipset_common/modules/hwusb/hdb/fdevent.cpp
-vendor/huawei/chipset_common/modules/hwusb/hdb/file_sync_service.cpp
-vendor/huawei/chipset_common/modules/hwusb/hdb/hdb_auth.cpp      <- exclusivo
-vendor/huawei/chipset_common/modules/hwusb/hdb/jdwp_service.cpp
-vendor/huawei/chipset_common/modules/hwusb/hdb/services.cpp
-vendor/huawei/chipset_common/modules/hwusb/hdb/shell_service.cpp
-vendor/huawei/chipset_common/modules/hwusb/hdb/sockets.cpp
-vendor/huawei/chipset_common/modules/hwusb/hdb/transport.cpp
-vendor/huawei/chipset_common/modules/hwusb/hdb/transport_usb.cpp
-```
+HDB is a separate FunctionFS function from ADB:
 
-Consequência: o framing de pacotes, os serviços (`shell:`, `sync:`, `jdwp`) e a
-semântica de streams são os do ADB. O que muda é autenticação, banner e o
-"install" via `pm`.
+| Interface class/subclass/protocol | Description | Daemon |
+|---|---|---|
+| `ff/48/01` | HDB Interface | `hdbd` |
+| `ff/42/01` | ADB Interface | `adbd` |
 
-## 2. Framing de pacote (APACKET)
+Observed composite VID/PID: `12d1:107f`. With both protocols enabled, HDB was
+interface 3, OUT `0x04` / IN `0x85`; with only HDB, it was interface 2. Do not
+hardcode the interface number or endpoints. Use descriptor discovery.
 
-24 bytes de cabeçalho, little-endian, seguidos de `data_length` bytes de dados:
+HDB's FunctionFS paths in the daemon are `/dev/usb-ffs/hdb/ep0`, `ep1`, `ep2`.
+The daemon includes paths under
+`vendor/huawei/chipset_common/modules/hwusb/hdb/` and is derived from ADB.
+
+The wire header is **24 bytes**, not 36 or 40:
 
 ```c
 struct amessage {
-    uint32_t command;      /* A_* */
+    uint32_t command;
     uint32_t arg0;
     uint32_t arg1;
     uint32_t data_length;
-    uint32_t data_crc32;   /* crc32 dos dados (0 para A_CNXN/A_AUTH) */
-    uint32_t magic;        /* command ^ 0xffffffff */
+    uint32_t data_check;
+    uint32_t magic;       // command ^ 0xffffffff
 };
+// followed by data_length bytes
 ```
 
-Constantes (valores do ADB, herdados pelo fork):
+All fields are little-endian. Commands are ASCII packed as little-endian words:
+`CNXN`, `AUTH`, `OPEN`, `OKAY`, `WRTE`, `CLSE`.
 
-| nome | valor | uso |
+The daemon's `apacket` has 12 bytes of internal metadata before `amessage`, with
+payload at internal offset `0x24`. In `remote_read` at `0x5b4c4`,
+`movs r2,#0x18; add r1,r4,#0xc; bl usb_read` reads only the 24-byte message
+header. `get_apacket` at `0x4fa74` allocates the larger internal structure.
+
+`calculate_apacket_checksum` at `0x4fa58` **sums payload bytes** modulo 2^32.
+Classic ADB also uses a sum, despite the historical field name `data_crc32`.
+ADB protocol version `0x01000001` can skip checksum checking; the HDB device
+advertises `0x01000000`, so this client uses sums throughout HDB sessions.
+
+Malformed CRC32/36-byte/40-byte probes in the initial research sometimes caused
+USB errors/re-enumeration. They do not establish a different protocol prefix,
+missing preamble, daemon crash or need for root. The obsolete codec was removed.
+
+## 2. First layer: USB key authorization — device-tested
+
+A known host key now authenticates with this sequence:
+
+```text
+host   -> device  CNXN(version=0x01000000, max_payload=262144)
+                  "host::features=;\0"
+device -> host    AUTH(TOKEN=1), 20 bytes
+host   -> device  AUTH(SIGNATURE=2), 256 bytes
+device -> host    CNXN(version=0x01000000, max_payload=262144), banner
+```
+
+The 20-byte TOKEN is passed directly to RSA PKCS#1 v1.5 / SHA-1 signing as a
+**prehashed digest**, matching the daemon's
+`RSA_verify(NID_sha1, token, 20, signature, ..., key)` call in
+`adbd_auth_verify` (`0x5b7ec`, call at `0x5baca`).
+
+The initial client incorrectly used `openssl dgst -sha1 -sign`, signing
+SHA1(TOKEN) instead. The corrected command is:
+
+```text
+openssl pkeyutl -sign -inkey host.pem \
+    -pkeyopt rsa_padding_mode:pkcs1 -pkeyopt digest:sha1
+```
+
+For an unknown key, another TOKEN after the first signature makes the host send
+`AUTH(RSAPUBLICKEY=3)`. A device-originated AUTH type 3 is **not** required by
+this flow. The public-key payload is:
+
+```text
+base64(Android RSAPublicKey blob) + " user@host" + NUL
+```
+
+The blob is 524 bytes: `uint32 len=64`, `n0inv`, 256-byte little-endian modulus,
+256-byte little-endian R² mod n, `uint32 exponent`. Without NUL, the daemon was
+observed logging `Key must be a null-terminated string`.
+
+Manual approval uses `com.android.systemui/.usb.HwUsbDebuggingActivity`.
+Authorized HDB keys are separate from ADB keys:
+`/data/misc/adb/hdb_keys`, versus `/data/misc/adb/adb_keys`.
+
+Older experiments logged `Invalid base64 key` while reading the HDB key file.
+Its cause was **not established**: empty/trailing lines, malformed experimental
+Binder approvals and the old client are all relevant possibilities. A log of an
+invalid line does not show that all keys are unusable. The new client reconnects
+successfully with the existing key, without clearing or modifying that store.
+
+There is no demonstrated requirement for root, rewriting `hdb_keys`, `_settle_auth`
+or repeated CNXN/OPEN retries. The current client returns after CNXN and surfaces
+a later AUTH restart as an error, rather than swallowing it.
+
+### Banner
+
+Observed (without trailing NUL):
+
+```text
+device::ro.product.name=KOB2-W09;ro.product.model=KOB2-W09;ro.product.device=HWKOB2;features=stat_v2,cmd,shell_v2
+```
+
+Parse semicolon-separated properties, then the comma-separated `features=`
+value. Product properties are not feature names. The banner type is `device`,
+not `hdb`. Features advertised by the daemon do not mean that the host has passed
+the second authentication layer.
+
+### Binder observations — historical only, not a client dependency
+
+Earlier device experiments identified `hwUsbExService`, interface
+`huawei.android.hardware.usb.IHwUsbManagerEx`:
+
+| Transaction | Interpreted method | Confidence |
 |---|---|---|
-| `A_SYNC`  | `0x434e5953` | ressincronização de stream |
-| `A_CNXN`  | `0x4e584e43` | connect + banner/versão |
-| `A_OPEN`  | `0x4e45504f` | abre stream (`"shell:..."`, `"sync:"`) |
-| `A_OKAY`  | `0x59414b4f` | confirma stream |
-| `A_CLSE`  | `0x45534c43` | fecha stream |
-| `A_WRTE`  | `0x45545257` | dados do stream |
-| `A_AUTH`  | `0x48545541` | autenticação |
+| 1 | `allowUsbHDB` | Method/log mapping; argument marshalling not established |
+| 2 | `denyUsbHDB` | Preliminary mapping |
+| 3 | `clearUsbHDBKeys` | Key-file deletion observed in logs |
+| 4 | `setHdbEnabled` | Preliminary mapping |
 
-(Os valores são o ASCII — `"CNXN"`, `"OPEN"`... — lido como `uint32` little-endian.)
+The previous `service call ... 1 s16 <fingerprint>` did **not** demonstrate a
+correct approval call. No full AIDL signature is claimed here. Those calls and
+ADB/uiautomator approval fallbacks were removed from the client. User approval
+is manual; the client neither deletes keys nor changes USB settings.
 
-## 2.1 (histórico) Struct interna de 36 bytes
+## 3. Second layer: Huawei service authentication
 
-> Superado por §2.1 abaixo: no fio vão apenas 24 bytes. Mantido como registro.
+### 3.1 Newly device-tested behavior
 
-Desmontando `hdbd` (Thumb, símbolos não removidos) o layout do `apacket` do HDB
-é **maior** que o do adb:
+After a successful USB authorization/banner, plain service opening fails:
 
-```
-offset  tamanho  campo
-0x00    4        prefixo de quadro (read_packet/write_packet tratam separado)
-0x04    4        desconhecido
-0x08    4        desconhecido
-0x0c    4        command
-0x10    4        arg0
-0x14    4        arg1
-0x18    4        data_length
-0x1c    4        data_check   (calculate_apacket_checksum)
-0x20    4        magic        (= ~command)
-0x24    ...      data
+```text
+host   -> device  OPEN(local_id=1, remote_id=0), "shell:id\0"
+device -> host    OPEN(arg0=1, arg1=0), "HDB AUTHENTICEXABORT\0"
 ```
 
-Evidências (endereços no binário do KOB2-W09):
+This is **not** an `OKAY`/`CLSE` stream reply. The old client ignored it and
+reported a timeout, leading to an incorrect diagnosis.
 
-| função | instruções |
-|---|---|
-| `check_header` @0x59445 | `ldr r0,[r6,#0xc]` / `ldr r1,[r6,#0x20]` / `mvns r0,r0; cmp r1,r0` / `ldr r0,[r5,#0xa0]` (max_payload) / `ldr r1,[r6,#0x18]` |
-| `send_packet` @0x57fd1 | `ldr r0,[r5,#0xc]; mvns r0,r0; str r0,[r5,#0x20]` e `str r0,[r5,#0x1c]` (checksum) |
-| `handle_packet` @0x50659 | lê comando de `[r4,#0xc]`, compara com `0x48545541` (A_AUTH) e `0x4e45504f` (A_OPEN), payload em `r4+0x24` |
-| `check_data` @0x59575 | compara `calculate_apacket_checksum` com `[r4,#0x1c]` |
-| `calculate_apacket_checksum` @0x4fa59 | **soma de bytes** (`ldrb; add; bne`), não CRC32 |
-| `get_apacket` @0x4fa75 | `malloc(36 + 0x80000)`, zera 0x00–0x2f → payload máx. **512 KB** |
-| `send_connect` @0x4fe35 | `get_apacket`; `str cmd,[r5,#0xc]`; arg0 `[r5,#0x10]`; arg1 `[r5,#0x14]`; banner em `r5+0x24`; `str len,[r5,#0x18]` — **nada em 0x00–0x0b** |
+Control requests beginning with `HDB ` use `A_OPEN` directly:
 
-Caminhos usados pela função USB (FunctionFS):
-
-```
-/dev/usb-ffs/hdb/ep0   (controle)
-/dev/usb-ffs/hdb/ep1   (bulk)
-/dev/usb-ffs/hdb/ep2   (bulk)
+```text
+host   -> device  OPEN(local_id=2, remote_id=0), "HDB AUTHENTICREQUSET\0"
+device -> host    OPEN(arg0=2, arg1=0),
+                  "HDB AUTHENTICRES3000" + 512 hex characters
 ```
 
-Implementação: `openhdb/protocol_hdb.py` (`HdbMessage`), com testes em
-`tests/test_protocol.py`.
+The misspelling `REQUSET` is present in the daemon. Each text prefix above is
+20 bytes, excluding NUL. The response contains 256 bytes of RSA ciphertext,
+not the first layer's 20-byte TOKEN. Its reported data_length was 532, excluding
+the NUL that the daemon writes after its payload.
 
-### Resultado empírico das tentativas de handshake
+`python -m openhdb auth-info` performs only this verified diagnostic. It does
+not claim to authenticate services. See [HDB_SESSION.md](HDB_SESSION.md).
 
-| tentativa na interface `ff/48/01` | resultado |
-|---|---|
-| leitura passiva (sem escrever) | timeout (dispositivo não fala primeiro) |
-| texto puro `HDB AUTHENTICPCIDENT\n` | aceito, sem resposta |
-| APACKET de 24 bytes (`A_CNXN`, `A_AUTH`…) | **EIO** + re-enumeração do USB |
-| prefixo 4B + cabeçalho 36B (`A_CNXN`, `A_AUTH`+texto), prefixo ∈ {0,1,0x24,'HDBS','HDSH'} | **EIO** + re-enumeração |
-| prefixo = tamanho total do quadro | EIO + re-enumeração |
-| quadro completo de 512 bytes (padding) | EIO + re-enumeração |
-| escrita em 2 partes (4B, depois 36B) | EIO + re-enumeração |
-| **ler a interface nova após a re-enumeração** | timeout — não há resposta pendente |
+### 3.2 Static control flow
 
-Detalhe importante: o `write` é **aceito** e o erro aparece na `read`
-(`EIO`/`ENODEV`) — o USB re-enumera, mas o `hdbd` **não crasha** (pid estável).
-A interface nova não traz dados, então a sessão não continua. Falta descobrir o
-que o `hdbd` espera antes do primeiro quadro (tamanho de leitura? passo de
-inicialização?) — próximo passo dinâmico: *usbmon* de uma sessão real.
+In `handle_packet` (`0x50658`):
 
-Conclusão: o `hdbd` rejeita o quadro antes de qualquer autenticação — falta
-descobrir a semântica do prefixo de 4 bytes (ou um passo de inicialização
-anterior a ele).
+- `0x506b6`: ordinary OPEN requires the transport's online flag.
+- `0x506e8..0x506f2`: compares the first four payload bytes with `"HDB "`.
+- `0x50a9c..0x50aa0`: HDB control payloads enter `hdb_auth` (`0x478e4`).
+- `0x50700`: other OPEN payloads enter `hdb_auth_do` (`0x47720`).
+- Only a successful check reaches `create_local_service_socket` (`0x5070e`).
 
-## 2.1 Formato no fio: cabeçalho de **24 bytes** (igual ao adb)
+Thus a successful USB key exchange does not by itself authorize `shell:` or
+`sync:`.
 
-A struct interna do `hdbd` tem 36 bytes, mas só **24 vão pelo fio**. Prova, em
-`remote_read` @0x5b4c4:
+Relevant functions:
 
-```
-movs r2, #0x18          ; lê 24 bytes
-add.w r1, r4, #0xc      ; grava em packet+0x0c
-bl   usb_read
-...
-ldr  r2, [r4, #0x18]    ; data_length
-add.w r1, r4, #0x24     ; buffer de dados = packet+0x24
-bl   usb_read
-```
-
-Ou seja: os 12 primeiros bytes da struct são internos (fora do fio) e o
-cabeçalho transmitido é o `amessage` clássico:
-
-| offset no fio | campo |
-|---|---|
-| 0x00 | command |
-| 0x04 | arg0 |
-| 0x08 | arg1 |
-| 0x0c | data_length |
-| 0x10 | data_check |
-| 0x14 | magic (= ~command) |
-
-**A única diferença em relação ao adb é o checksum**: `calculate_apacket_checksum`
-@0x4fa59 soma os bytes (`ldrb; add; bne`), em vez de CRC32.
-
-## 2.2 Handshake verificado (funciona!)
-
-```
-host   -> device : A_CNXN  arg0=A_VERSION  arg1=max_payload  "host::features=..."
-device -> host   : A_AUTH  arg0=TOKEN(1)  + nonce de 20 bytes
-host   -> device : A_AUTH  arg0=SIGNATURE(2)  (PKCS#1 v1.5 / SHA-1, 256 bytes)
-device -> host   : A_AUTH  arg0=RSAPUBLICKEY(3)   [quando a chave não é conhecida]
-host   -> device : A_AUTH  arg0=RSAPUBLICKEY(3)  base64(blob) + " user@host" + NUL
-device           : mostra HwUsbDebuggingActivity ("Permitir conexão via HDB?")
-                   grava a chave em /data/misc/adb/hdb_keys
-device -> host   : A_CNXN  banner "device::ro.product.name=KOB2-W09;...;features=stat_v2,cmd,shell_v2"
-```
-
-Detalhes confirmados na prática:
-
-- o payload da chave pública **precisa terminar em `\0`** — sem isso o `hdbd`
-  responde `Key must be a null-terminated string` e o framework grava uma linha
-  vazia em `hdb_keys` (que depois falha com `Invalid base64 key`);
-- o banner é `device::...` (não `hdb::`);
-- a versão anunciada pelo aparelho é `0x01000000` e `max_payload=262144`;
-- features: `stat_v2, cmd, shell_v2`.
-
-Estado atual do cliente: **conecta e recebe o banner** (testado várias vezes).
-
-### Serviço de controle: `hwUsbExService` (IHwUsbManagerEx)
-
-Descoberto no aparelho e **mapeado por experimento** (`service call`):
-
-| código | método | efeito observado |
+| Function | Address | Evidence |
 |---|---|---|
-| 1 | `allowUsbHDB` | aprova a chave (espera fingerprint: `Got , expected 6D:6E:...`) |
-| 2 | `denyUsbHDB` | nega |
-| 3 | `clearUsbHDBKeys` | `deleteKeyFile success ? true` — apaga o `hdb_keys` |
-| 4 | `setHdbEnabled` | liga/desliga o HDB |
+| `send_auth_respone` [sic] | `0x473d8` | generates 20 random bytes; calls RSA_public_encrypt with PKCS#1 padding; hex-encodes 256 output bytes after RES3000 |
+| `hdb_auth` | `0x478e4` | dispatches REQUSET/PCIDENT; RSA_public_decrypt and SHA-256 validation; builds CONFIRM/EXABORT replies |
+| `hdb_auth_do` | `0x47720` | checks a session slot, counter/replay state and a SHA-256 command authenticator |
+| `send_hdbauth_failure` | `0x47624` | replaces payload with AUTHENTICEXABORT, sends the packet back |
 
-```bash
-adb shell service call hwUsbExService 3 s16 x    # limpa o store de chaves
-adb shell service call hwUsbExService 4 i32 1    # HDB on
+The daemon contains an Android-format RSA public key in `rsa_pub` (`0x111000`),
+and a runtime RSA pointer `g_RSA_PubKey` (`0x11992c`). `init()` (`0x47070`)
+reads `rsa_pub`, decodes the 524-byte blob and passes `&g_RSA_PubKey` to
+`android_pubkey_decode` at `0x470b6`. This confirms that the additional crypto
+uses the embedded key, separate from the user-approved host USB key. No matching
+private key has been established or included in the project.
+
+### 3.3 Partial reconstruction — not validated end-to-end
+
+The following describes static analysis, **not a completed implementation**:
+
+1. REQUSET produces an RSA-encrypted 20-byte device nonce.
+2. PCIDENT includes a 40-hex-character client nonce at payload offset 20, then
+   a 512-hex-character RSA block at payload offset 61.
+3. `RSA_public_decrypt(..., RSA_PKCS1_PADDING)` recovers data whose first 20 bytes
+   are used with the device nonce in a SHA-256 calculation. The digest is compared
+   with recovered bytes at offset 20. Success produces CONFIRM and session state.
+4. CONFIRM includes a space and a session-slot character. Session state contains
+   nonce-derived SHA-256 material and replay/counter bookkeeping.
+5. `hdb_auth_do` rejects short unauthenticated commands and expects a suffix with
+   slot information, a 64-hex-character SHA-256 value and an 8-character counter.
+   The digest includes a bounded command prefix, counter and session secret.
+
+The exact encoding, key provenance, host-side private operation, session lifecycle
+and signed-command construction still require corroboration with a legitimate
+host implementation/session. Generating an arbitrary RSA key is not evidence that
+this fixed-key exchange can be completed. No claim of a bypass is made.
+
+## 4. Installation: previous assumption corrected
+
+In `service_to_fd` (`0x48b90`), a `shell` request beginning with `:pm install`
+is routed through `pm_auth_install` (`0x47198`, call at `0x4914a`).
+
+Static flow in `pm_auth_install`:
+
+- `0x471f6`: generates a 32-byte random install key.
+- `0x47202..0x47222`: encodes it as 64 hexadecimal characters.
+- `0x47236`: sends that key to the framework through `hdbd_send_install_key`.
+- `0x47250`: formats a string containing original install arguments and the key.
+- `0x4725e..0x47276`: SHA-256 of that string.
+- `0x4727c..0x47296`: hex-encodes the digest.
+- `0x472b0`: builds `:pm install --hwhdb %s %s`, where the first substitution is
+  the **hexadecimal digest**, not the APK size.
+
+The earlier command:
+
+```text
+pm install --hwhdb 3901 /data/local/tmp/hello-hdb.apk
 ```
 
-### Instabilidade conhecida: `hdb_keys` corrompido
+failed with `INSTALL_HDB_VERIFY_FAILED`, but `3901` was not a valid authentication
+hash. This experiment cannot determine which APK signatures are accepted, nor
+prove that a self-signed Hello World is impossible to install by HDB. Correct
+installation still needs service authentication plus the daemon/framework flow.
 
-O framework (`HwUsbHDBManager.writeKey`) grava `/data/misc/adb/hdb_keys` com uma
-linha inválida — o `hdbd` registra em toda tentativa:
+The current client no longer invents `--hwhdb <file_size>`. It uploads via sync
+and issues an ordinary `pm install -r ...`; the daemon's own rewriting path, if
+reached, must be evaluated on hardware. That operation is **not HDB-validated**.
+Previous successful Hello World installations used the **ADB USB interface**.
 
-```
-I hdbd: Loading keys from /data/misc/adb/hdb_keys
-E hdbd: Invalid base64 key  in /data/misc/adb/hdb_keys
-```
+## 5. Implementation scope and next work
 
-Consequência: a chave só vale **em memória**, na janela logo após a aprovação
-(`allowUsbHDB`). Sessões seguintes voltam ao ciclo TOKEN/SIGNATURE e o `A_OPEN`
-é ignorado. Limpar esse arquivo exige root (ou apagar via framework numa build
-que não tenha o bug).
+Implemented without the ADB executable or ADB USB channel:
 
-### Fluxo de auth no tempo
+- strict HDB descriptor selection (default), serial filtering and safe claiming;
+- byte-sum framing, bounded/buffered reads preserving data across timeouts;
+- correct prehashed USB RSA authorization and manual key approval;
+- explicit error for Huawei control responses instead of retrying/ignoring them;
+- diagnostic REQUSET/RES3000 exchange;
+- shared stream and binary sync v1 code, tested offline but still gated on HDB.
 
-```
-host: CNXN ──────────────────────────────┐
-device: AUTH TOKEN                       │  o hdbd manda o banner ANTES de
-host: AUTH SIGNATURE                     │  terminar a auth; é preciso
-device: AUTH RSAPUBLICKEY (se nova)      │  continuar respondendo TOKENs
-host: AUTH RSAPUBLICKEY + NUL            │  (implementado em _settle_auth)
-device: (framework) HwUsbDebuggingActivity → allowUsbHDB
-device: CNXN banner "device::..."        │
-```
+Open work:
 
-## 3. Banner
+- identify the legitimate host-side cryptographic material/operation for PCIDENT;
+- validate CONFIRM and command suffixes rather than guessing keys or padding;
+- validate HDB shell, sync push/pull and `pm_auth_install` end-to-end;
+- map the real Binder AIDL only if needed for documentation, not as an ADB crutch;
+- expand coverage across devices/firmware, USB permissions and disconnect cases.
 
-Formato confirmado pelas strings `%s::%s`, `features=%s`, `parse_banner: %s`:
-
-```
-<tipo>::<feature>,<feature>,...
-```
-
-O binário contém as strings `adb` e `hdb` separadas, e a propriedade
-`adb_device_banner` / `device_banner`. **Hipótese a confirmar**: o tipo do banner
-é `hdb` (contra `device` no adbd puro). A ferramenta `openhdb probe` imprime o
-banner bruto para resolver isso empiricamente.
-
-## 3.1 Autenticação do HDB: vocabulário verificado
-
-O HDB **não** usa o par `AUTH/TOKEN` + `AUTH/SIGNATURE` do adb. O binário contém
-um conjunto próprio de mensagens nomeadas:
-
-```
-HDB AUTHENTICPCIDENT     (o PC se identifica)
-HDB AUTHENTICREQUSET     (o dispositivo envia o desafio)   [sic: typo da Huawei]
-HDB AUTHENTICCONFIRM     (confirmação)
-HDB AUTHENTICEXABORT     (aborto)
-HDB AUTHENTICRES3000     (código de resultado)
-HDB RSA_public_encrypt failure
-HDB%s
-```
-
-Funções correspondentes: `hdb_auth`, `hdb_auth_do`, `send_auth_request`,
-`send_auth_respone` [sic], `send_hdbauth_failure`, `pm_auth_install`,
-`adbd_auth_verify`, `adbd_auth_verified`, `adbd_auth_init`.
-
-**Hipótese de fluxo** (a confirmar com `openhdb probe --force -v`):
-
-```
-host -> device : HDB AUTHENTICPCIDENT <id/base64 da chave>
-device -> host : HDB AUTHENTICREQUSET <challenge>
-host -> device : <resposta RSA>            (RSA_public_encrypt no lado do device)
-device -> host : HDB AUTHENTICCONFIRM
-```
-
-Diferença importante em relação ao adb: o dispositivo usa
-`RSA_public_encrypt`/`RSA_verify` (as strings `RSA_verify success`/`failure`
-aparecem no binário), então pode haver validação contra **chave fixa da Huawei**,
-não apenas TOFU.
-
-## 3.2 Interfaces USB (verificado no KOB2-W09, modo `12d1:107f`)
-
-| itf | classe | iInterface | endpoints | protocolo |
-|---|---|---|---|---|
-| 0 | `ff/ff/00` | MTP | — | MTP |
-| 1 | `08/06/50` | Mass Storage | — | BOT |
-| 2 | `ff/42/01` | ADB Interface | OUT `0x03` / IN `0x84` | **adbd** (adb clássico) |
-| 3 | `ff/48/01` | HDB Interface | OUT `0x04` / IN `0x85` | **hdbd** (handshake próprio) |
-
-Comportamento observado:
-
-- Interface ADB: nosso `A_CNXN` é aceito e o dispositivo responde
-  `A_AUTH arg0=TOKEN(1)` com 20 bytes de nonce — **o codificador de pacotes do
-  open-hdb foi validado contra o `adbd` real**.
-- Interface HDB: um `A_CNXN` faz o endpoint devolver `EIO` e o dispositivo
-  **re-enumerar no USB** (`hdbd` reinicia). Ou seja: o HDB rejeita o framing do
-  adb logo no primeiro pacote. É por isso que `openhdb probe` só faz leitura
-  passiva na interface HDB, a menos que se use `--force`.
-
-## 4. Autenticação (hdb_auth)
-
-Símbolos presentes: `_Z8hdb_authP7apacketP10atransport` (`hdb_auth`),
-`_Z11hdb_auth_doP7apacketP10atransporti` (`hdb_auth_do`),
-`_Z20send_hdbauth_failureP7apacketP10atransport`,
-`hdb_auth.cpp`, `auth_required`, `rsa_pub`, `/hdb_keys`,
-`/data/misc/adb/hdb_keys`, `getHdbKey`, `sHdbKey`.
-
-Fluxo derivado do ADB, com desvios marcados:
-
-1. Dispositivo → host: `A_CNXN` com banner.
-2. Host → dispositivo: `A_CNXN` (`A_VERSION`, `max_payload`).
-3. Se `auth_required`, o dispositivo envia `A_AUTH` `arg0=TOKEN(1)` + 20 bytes de nonce.
-4. Host responde `A_AUTH` `arg0=SIGNATURE(2)` com a assinatura PKCS#1 v1.5/SHA-1 do nonce.
-5. Se a assinatura não confere, o dispositivo responde `A_AUTH` `arg0=RSAPUBLICKEY(3)`
-   e grava a chave em `/data/misc/adb/hdb_keys` (store **separado** do `/data/misc/adb/adb_keys`).
-
-Pontos a confirmar no binário: se `hdb_auth_do` usa `RSA_verify` com um
-certificado fixo da Huawei (as strings `RSA_verify success` / `RSA_verify failure`
-aparecem no binário) antes de aceitar o token, o que tornaria o passo 4 diferente
-do ADB.
-
-## 5. Instalação
-
-O `hdbd` executa, ao receber um pedido de instalação:
-
-```
-pm install --hwhdb <tamanho> <caminho>
-```
-
-(extraído da string `:pm install --hwhdb %s %s`.)
-
-Verificado no dispositivo:
-
-```
-$ pm install --hwhdb 3901 /data/local/tmp/hello-hdb.apk
-Failure [INSTALL_FAILED_INTERNAL_ERROR: Failure [INSTALL_HDB_VERIFY_FAILED]]
-```
-
-Ou seja: o caminho de instalação do HDB **valida o APK** (assinatura/verificação
-Huawei) antes de instalar. Um APK auto-assinado é recusado — o HDB é mais
-restritivo que o ADB, não menos.
-
-## 6. USB
-
-O HDB é uma função FunctionFS própria, com estado exposto pelo sistema:
-
-```
-sys.usb.ffs_hdb.ready = 1
-persist.service.hdb.enable = true
-settings system hdb_enabled = 1
-init.svc.hdbd = running
-```
-
-Na configuração composta (`12d1:107f`) as interfaces observadas foram:
-
-| # | classe | descrição |
-|---|---|---|
-| 0 | `ff/42/01` | MTP |
-| 1 | `08/06/50` | Mass Storage |
-| 2 | `ff/42/01` | **ADB Interface** (iInterface=8) |
-
-Interface do HDB **a identificar** — o `probe` reporta todas as interfaces com
-`class=0xff, subclass=0x42, protocol=0x01` e o banner lido de cada uma.
-
-## 7. Aberto
-
-- [x] qual interface USB pertence ao `hdbd` (itf ff/48/01, ep 04/85)
-- [x] framing no fio: 24 bytes, checksum = soma de bytes
-- [ ] nome do serviço de shell no HDB ("shell:" não existe no binário; testar "shell" puro)
-- [ ] por que `/data/misc/adb/hdb_keys` fica com linha inválida (bug do framework)
-- [ ] formato das mensagens `HDB AUTHENTIC*` (texto puro? A_AUTH com payload?)
-- [ ] se o handshake do HDB começa com um magic/hello diferente de A_CNXN
-- [ ] valor do tipo no banner (`hdb` vs `device`) e lista de features (o HDB não aceita CNXN, logo o banner vem por outro caminho)
-- [ ] se `hdb_auth` valida uma chave fixa da Huawei ou apenas TOFU como o ADB
-- [ ] formato exato do serviço de backup/restore (`backup:` / `restore:`)
-- [ ] pacote de instalação (`pm install --hwhdb`) — quem fornece o fd
+Root, bootloader unlocking, key-file editing and APK-signing restrictions are
+**not established prerequisites** for finishing this client.

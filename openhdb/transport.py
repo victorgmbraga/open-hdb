@@ -1,5 +1,4 @@
-"""Camada de conexão: ``A_CNXN`` + autenticação + streams."""
-
+"""CNXN/AUTH e streams no framing compartilhado por ADB e HDB."""
 from __future__ import annotations
 
 import time
@@ -7,18 +6,25 @@ from pathlib import Path
 
 from . import auth, protocol
 from .protocol import Message
-from .usb import TransportError, UsbTransport
+from .usb import TransportError, TransportTimeout, UsbTransport
 
-HOST_FEATURES = ["shell_v2", "cmd", "stat_v2", "ls_v2", "libusb"]
+# Não anunciar serviços/protocolos que este cliente ainda não implementa.
+HOST_FEATURES: list[str] = []
 
 
-class ConnectionError_(RuntimeError):
+class ConnectionError_(TransportError):
+    pass
+
+
+class ServiceAuthRequired(ConnectionError_):
+    """A autorização USB funcionou, mas falta a autenticação Huawei de serviços."""
+
+
+class ServiceRejected(ConnectionError_):
     pass
 
 
 class Stream:
-    """Um stream aberto (equivale a um socket do adb)."""
-
     def __init__(self, conn: "HdbConnection", local_id: int):
         self.conn = conn
         self.local_id = local_id
@@ -26,40 +32,38 @@ class Stream:
         self.buffer = bytearray()
         self.closed = False
 
-    def write(self, data: bytes) -> None:
-        if self.remote_id is None:
-            raise ConnectionError_("stream não confirmado (A_OKAY não recebido)")
-        for off in range(0, len(data), protocol.MAX_PAYLOAD):
-            chunk = data[off : off + protocol.MAX_PAYLOAD]
+    def write(self, data: bytes, timeout: float = 5.0) -> None:
+        if self.remote_id is None or self.closed:
+            raise ConnectionError_("stream não está aberto")
+        deadline = time.monotonic() + timeout
+        for off in range(0, len(data), self.conn.max_payload):
+            chunk = data[off:off + self.conn.max_payload]
             self.conn.send(Message(protocol.A_WRTE, self.local_id, self.remote_id, chunk))
-            self.conn.wait_ack(self)
+            self.conn.wait_ack(self, max(0.0, deadline - time.monotonic()))
 
     def read(self, timeout: float = 5.0) -> bytes | None:
-        """Lê o que houver; ``None`` quando o stream fecha."""
-        if self.buffer:
-            data, self.buffer = bytes(self.buffer), bytearray()
-            return data
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while True:
+            if self.buffer:
+                data, self.buffer = bytes(self.buffer), bytearray()
+                return data
             if self.closed:
                 return None
-            remaining = max(0.05, deadline - time.monotonic())
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TransportTimeout("timeout lendo stream")
             try:
-                msg = self.conn.recv(timeout=min(remaining, 0.5))
-            except TransportError:
+                self.conn.dispatch(self.conn.recv(timeout=min(remaining, 0.5)))
+            except TransportTimeout:
                 continue
-            if self.conn.dispatch(msg):
-                if self.buffer:
-                    data, self.buffer = bytes(self.buffer), bytearray()
-                    return data
-                if self.closed:
-                    return None
-        return b""
 
     def close(self) -> None:
-        if self.remote_id is not None and not self.closed:
-            self.conn.send(Message(protocol.A_CLSE, self.local_id, self.remote_id))
+        try:
+            if self.remote_id is not None and not self.closed:
+                self.conn.send(Message(protocol.A_CLSE, self.local_id, self.remote_id))
+        finally:
             self.closed = True
+            self.conn._streams.pop(self.local_id, None)
 
     def __enter__(self):
         return self
@@ -69,34 +73,32 @@ class Stream:
 
 
 class HdbConnection:
-    """Conecta, autentica e multiplexa streams sobre um transporte USB."""
-
-    def __init__(self, transport: UsbTransport, key_path: Path | None = None, verbose: bool = False,
-                 checksum: str = "crc32", approve=None):
+    def __init__(self, transport: UsbTransport, key_path: Path | None = None,
+                 verbose: bool = False, checksum: str = "sum", approve=None,
+                 transport_kind: str = "hdb"):
         self.transport = transport
         self.checksum = checksum
-        self.approve = approve  # callable(fingerprint) -> None, para aprovar sem UI
-        self.is_hdb = checksum == "sum"
-        self._last_approve = 0.0
+        self.approve = approve  # callback opcional; nunca chama ADB por conta própria
+        self.transport_kind = transport_kind
+        self.is_hdb = transport_kind == "hdb"
         self.key_path = auth.ensure_key(key_path or auth.DEFAULT_KEY)
         self.verbose = verbose
         self.banner: str | None = None
         self.features: list[str] = []
-        self.version: int = 0
-        self.max_payload: int = protocol.MAX_PAYLOAD
+        self.version = 0
+        self.max_payload = protocol.MAX_PAYLOAD
         self.online = False
         self.kind: str | None = None
         self._tokens = 0
         self._key_sent = False
         self._next_id = 1
         self._streams: dict[int, Stream] = {}
-        self._log: list[Message] = []
 
-    # -- utilitários --------------------------------------------------------
     def _trace(self, direction: str, msg: Message) -> None:
-        self._log.append(msg)
         if self.verbose:
-            print(f"  {direction} {msg}")
+            import sys
+            detail = f" {msg.data[:80]!r}" if msg.data.startswith(b"HDB ") else ""
+            print(f"  {direction} {msg}{detail}", file=sys.stderr)
 
     def send(self, msg: Message) -> None:
         self._trace(">>", msg)
@@ -104,142 +106,135 @@ class HdbConnection:
         self.transport.send_raw(header, data)
 
     def recv(self, timeout: float = 2.0) -> Message:
-        msg = self.transport.recv(int(timeout * 1000))
+        msg = self.transport.recv(max(1, int(timeout * 1000)))
         self._trace("<<", msg)
         return msg
 
-    # -- handshake ----------------------------------------------------------
-    def connect(self, timeout: float = 15.0) -> str:
-        """Executa CNXN + AUTH. Retorna o banner do dispositivo."""
-        self.send(
-            Message(
-                protocol.A_CNXN,
-                protocol.A_VERSION,
-                protocol.MAX_PAYLOAD,
-                protocol.make_banner("host", HOST_FEATURES).encode(),
-            )
-        )
+    def connect(self, timeout: float = 60.0) -> str:
+        offered_version = protocol.A_VERSION_MIN if self.is_hdb else protocol.A_VERSION
+        self.transport.skip_checksum = offered_version >= protocol.A_VERSION_SKIP_CHECKSUM
+        self.send(Message(protocol.A_CNXN, offered_version, protocol.MAX_PAYLOAD,
+                          protocol.make_banner("host", HOST_FEATURES).encode()))
         deadline = time.monotonic() + timeout
-        sent_key = False
-        last_cnxn = time.monotonic()
         while time.monotonic() < deadline:
-            # (sem reenvio de CNXN: reenviar faz o USB re-enumerar e derruba o ADB,
-            #  que é quem toca o diálogo de aprovação)
             try:
-                msg = self.recv(timeout=min(3.0, max(0.2, deadline - time.monotonic())))
-            except TransportError:
-                continue  # timeout: segue tentando (e reenvia CNXN)
+                msg = self.recv(timeout=min(1.0, deadline - time.monotonic()))
+            except TransportTimeout:
+                continue
             if msg.command == protocol.A_CNXN:
-                self.banner = msg.data.decode(errors="replace")
+                if not protocol.A_VERSION_MIN <= msg.arg0 <= protocol.A_VERSION:
+                    raise ConnectionError_(f"versão não suportada: {msg.arg0:#x}")
+                if msg.arg1 == 0:
+                    raise ConnectionError_(f"max_payload inválido: {msg.arg1}")
+                self.banner = msg.data.rstrip(b"\0").decode(errors="replace")
                 self.kind, self.features = protocol.parse_banner(self.banner)
-                self.version, self.max_payload = msg.arg0, msg.arg1 or protocol.MAX_PAYLOAD
+                self.version = msg.arg0
+                self.max_payload = min(msg.arg1, protocol.MAX_PAYLOAD)
+                self.transport.skip_checksum = msg.arg0 >= protocol.A_VERSION_SKIP_CHECKSUM
                 self.online = True
-                # o hdbd manda o banner antes de terminar a auth: responde os
-                # TOKENs por um tempo curto antes de liberar a conexão
-                self._settle_auth(grace=8.0)
                 return self.banner
             if msg.command == protocol.A_AUTH:
-                self._handle_auth(msg, sent_key)
-                sent_key = sent_key or msg.arg0 == protocol.AUTH_RSAPUBLICKEY
-                continue
-            if msg.command == protocol.A_STLS:
+                self._handle_auth(msg)
+            elif msg.command == protocol.A_STLS:
                 raise ConnectionError_("dispositivo exigiu TLS (A_STLS), não suportado")
-        raise ConnectionError_("timeout esperando A_CNXN do dispositivo")
+            else:
+                raise ConnectionError_(f"pacote inesperado durante autenticação: {msg}")
+        raise ConnectionError_("timeout na autorização USB; desbloqueie o tablet e aprove a chave")
 
-    def _settle_auth(self, grace: float = 3.0, max_total: float = 6.0) -> None:
-        """Responde A_AUTH por no máximo ``grace`` (teto rígido ``max_total``)."""
-        import time as _t
-
-        start = _t.monotonic()
-        end = start + grace
-        while _t.monotonic() < end and _t.monotonic() - start < max_total:
-            try:
-                msg = self.recv(timeout=0.5)
-            except TransportError:
-                continue
-            if msg.command == protocol.A_AUTH:
-                self._handle_auth(msg, self._key_sent)
-                end = min(_t.monotonic() + 1.0, start + max_total)
-
-    def _handle_auth(self, msg: Message, already_sent_key: bool) -> None:
-        if msg.arg0 == protocol.AUTH_TOKEN:
-            self._tokens += 1
-            # 1a tentativa: assinatura. Se o dispositivo recusar (reenvia TOKEN),
-            # registramos a chave pública — é o fluxo que o HiSuite usa.
-            if self._tokens >= 2 and not self._key_sent:
-                key = auth.encoded_public_key(self.key_path)
-                self._key_sent = True
-                self.send(Message(protocol.A_AUTH, protocol.AUTH_RSAPUBLICKEY, 0, key + b"\0"))
-                return
-            signature = auth.sign_token(self.key_path, msg.data[:20])
+    def _handle_auth(self, msg: Message) -> None:
+        if msg.arg0 != protocol.AUTH_TOKEN:
+            raise ConnectionError_(f"AUTH inesperado do dispositivo: arg0={msg.arg0}")
+        if len(msg.data) != 20:
+            raise ConnectionError_(f"TOKEN inválido: {len(msg.data)} bytes")
+        self._tokens += 1
+        if self._tokens == 1:
+            signature = auth.sign_token(self.key_path, msg.data)
             self.send(Message(protocol.A_AUTH, protocol.AUTH_SIGNATURE, 0, signature))
-            return
-        if msg.arg0 == protocol.AUTH_RSAPUBLICKEY:
-            key = auth.encoded_public_key(self.key_path)
-            self.send(Message(protocol.A_AUTH, protocol.AUTH_RSAPUBLICKEY, 0, key + b"\0"))
-            # modo one-shot: aprova sozinho pelo fingerprint (como o HiSuite)
+        elif not self._key_sent:
+            key = auth.encoded_public_key(self.key_path) + b"\0"
+            self.send(Message(protocol.A_AUTH, protocol.AUTH_RSAPUBLICKEY, 0, key))
+            self._key_sent = True
             if self.approve:
-                import time as _t
+                self.approve(auth.fingerprint(self.key_path))
+        else:
+            raise ConnectionError_("autorização USB recusada ou reiniciada após envio da chave")
 
-                if _t.monotonic() - self._last_approve > 2.0:
-                    self._last_approve = _t.monotonic()
-                    try:
-                        self.approve(auth.fingerprint(self.key_path))
-                    except Exception as exc:  # noqa: BLE001
-                        if self.verbose:
-                            print(f"  (aprovação automática falhou: {exc})")
-            return
-        raise ConnectionError_(f"A_AUTH desconhecido: arg0={msg.arg0}")
-
-    # -- streams ------------------------------------------------------------
-    def open(self, service: str, timeout: float = 5.0, retries: int = 4) -> Stream:
-        """Abre um stream; reenvia o A_OPEN se o dispositivo ainda estiver em auth."""
-        last: Exception | None = None
-        for attempt in range(retries):
-            try:
-                return self._open_once(service, timeout)
-            except TransportError as exc:
-                last = exc
-                self._settle_auth(grace=1.5)
-        raise last or TransportError("não consegui abrir o stream")
-
-    def _open_once(self, service: str, timeout: float = 5.0) -> Stream:
+    def _allocate_id(self) -> int:
         local_id = self._next_id
         self._next_id += 1
-        stream = Stream(self, local_id)
-        self._streams[local_id] = stream
-        self.send(Message(protocol.A_OPEN, local_id, 0, service.encode() + b"\0"))
+        return local_id
+
+    def hdb_auth_exchange(self, payload: bytes, timeout: float = 5.0) -> bytes:
+        """Troca de controle HDB via A_OPEN (não é um serviço de shell).
+
+        Helper de pesquisa: não implementa a resposta RSA da Huawei nem usa ADB.
+        """
+        if not self.online or not self.is_hdb or not payload.startswith(b"HDB "):
+            raise ConnectionError_("troca de controle requer conexão HDB e payload 'HDB '")
+        local_id = self._allocate_id()
+        self.send(Message(protocol.A_OPEN, local_id, 0, payload.rstrip(b"\0") + b"\0"))
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if stream.remote_id is not None:
-                return stream
-            msg = self.recv(timeout=min(1.0, max(0.1, deadline - time.monotonic())))
+            try:
+                msg = self.recv(min(0.5, deadline - time.monotonic()))
+            except TransportTimeout:
+                continue
+            if msg.command == protocol.A_OPEN and msg.arg0 == local_id and msg.data.startswith(b"HDB "):
+                return msg.data.rstrip(b"\0")
             self.dispatch(msg)
-        raise ConnectionError_(f"timeout abrindo stream {service!r}")
+        raise TransportTimeout("timeout na troca de controle HDB")
+
+    def open(self, service: str, timeout: float = 5.0) -> Stream:
+        if not self.online:
+            raise ConnectionError_("conexão não autenticada")
+        local_id = self._allocate_id()
+        stream = Stream(self, local_id)
+        self._streams[local_id] = stream
+        deadline = time.monotonic() + timeout
+        try:
+            self.send(Message(protocol.A_OPEN, local_id, 0, service.encode() + b"\0"))
+            while time.monotonic() < deadline:
+                if stream.closed:
+                    raise ServiceRejected(f"serviço recusado: {service!r}")
+                if stream.remote_id is not None:
+                    return stream
+                try:
+                    self.dispatch(self.recv(min(0.5, deadline - time.monotonic())))
+                except TransportTimeout:
+                    continue
+            raise TransportTimeout(f"timeout abrindo serviço {service!r}")
+        except Exception:
+            stream.close()
+            raise
 
     def dispatch(self, msg: Message) -> bool:
-        """Roteia a mensagem. Retorna True se consumiu (stream ou auth)."""
+        if self.is_hdb and msg.command == protocol.A_OPEN and msg.data.startswith(b"HDB "):
+            reply = msg.data.rstrip(b"\0").decode(errors="replace")
+            raise ServiceAuthRequired(
+                f"hdbd respondeu {reply!r}: autorização USB não basta; "
+                "a autenticação Huawei de serviços ainda não foi implementada")
         if msg.command == protocol.A_AUTH:
-            # o hdbd continua pedindo TOKEN depois do CNXN; responder é obrigatório
-            self._handle_auth(msg, self._key_sent)
-            return True
+            self.online = False
+            raise ConnectionError_("dispositivo reiniciou a autorização USB após CNXN")
         if msg.command == protocol.A_OKAY:
             stream = self._streams.get(msg.arg1)
-            if stream is not None:
+            if stream is not None and msg.arg0:
+                if stream.remote_id not in (None, msg.arg0):
+                    raise ConnectionError_("ID remoto inesperado em OKAY")
                 stream.remote_id = msg.arg0
                 return True
         elif msg.command == protocol.A_WRTE:
             stream = self._streams.get(msg.arg1)
-            if stream is not None:
+            if stream is not None and stream.remote_id == msg.arg0:
                 stream.buffer.extend(msg.data)
                 self.send(Message(protocol.A_OKAY, msg.arg1, msg.arg0))
                 return True
         elif msg.command == protocol.A_CLSE:
             stream = self._streams.get(msg.arg1)
             if stream is not None:
+                if not stream.closed and stream.remote_id is not None:
+                    self.send(Message(protocol.A_CLSE, msg.arg1, msg.arg0))
                 stream.closed = True
-                stream.remote_id = msg.arg0
-                self.send(Message(protocol.A_CLSE, msg.arg1, msg.arg0))
                 self._streams.pop(msg.arg1, None)
                 return True
         return False
@@ -247,13 +242,16 @@ class HdbConnection:
     def wait_ack(self, stream: Stream, timeout: float = 5.0) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            msg = self.recv(timeout=0.5)
-            if self.dispatch(msg):
-                if msg.command == protocol.A_OKAY and msg.arg1 == stream.local_id:
-                    return
+            try:
+                msg = self.recv(min(0.5, deadline - time.monotonic()))
+            except TransportTimeout:
+                continue
+            self.dispatch(msg)
             if stream.closed:
+                raise ServiceRejected("stream fechado antes de confirmar escrita")
+            if msg.command == protocol.A_OKAY and msg.arg1 == stream.local_id:
                 return
-        raise ConnectionError_("timeout esperando A_OKAY de escrita")
+        raise TransportTimeout("timeout esperando OKAY de escrita")
 
     def __enter__(self):
         return self
@@ -262,9 +260,12 @@ class HdbConnection:
         self.close()
 
     def close(self) -> None:
-        for stream in list(self._streams.values()):
-            try:
-                stream.close()
-            except Exception:
-                pass
-        self.transport.close()
+        try:
+            for stream in list(self._streams.values()):
+                try:
+                    stream.close()
+                except TransportError:
+                    pass
+        finally:
+            self.online = False
+            self.transport.close()

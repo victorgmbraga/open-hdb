@@ -1,14 +1,12 @@
 """Transporte USB para HDB.
 
-O ``hdbd`` usa FunctionFS, como o ``adbd``, então a interface se anuncia como
-``class=0xff, subclass=0x42, protocol=0x01``. Numa configuração composta da
-Huawei (``12d1:107f``) existem várias dessas — este módulo lista todas e deixa o
-chamador escolher qual responde com o banner do HDB.
+O ``hdbd`` usa FunctionFS: ff/48/01 é HDB; ff/42/01 é ADB.
+A seleção da interface é explícita; não há chamadas ao executável ``adb``.
 
 Requer ``pyusb`` e acesso ao nó do dispositivo (udev/ACL).
 
-Atenção: se o ``adb server`` estiver rodando, ele toma a interface e o claim
-falha com EBUSY. Rode ``adb kill-server`` antes.
+Um ``adb server`` pode ocupar ff/42 (EBUSY no modo ADB explícito).
+O canal HDB ff/48 é separado: não é necessário iniciar/parar esse servidor.
 """
 
 from __future__ import annotations
@@ -35,8 +33,12 @@ class TransportError(RuntimeError):
     pass
 
 
+class TransportTimeout(TransportError):
+    """Espera expirou, sem confundir com desconexão ou falha de protocolo."""
+
+
 class Interface:
-    """Uma interface candidata (ff/42/01) de um dispositivo USB."""
+    """Uma interface candidata HDB (ff/48/01) ou ADB (ff/42/01)."""
 
     def __init__(self, device, config, intf):
         self.device = device
@@ -65,34 +67,34 @@ class UsbTransport:
         self._ep_in = None
         self._ep_out = None
         self._claimed = False
+        self._detached = False
+        self._rx = bytearray()
+        self.skip_checksum = False
 
     # -- ciclo de vida ------------------------------------------------------
     def open(self) -> "UsbTransport":
         dev = self.dev
-        cfg = self.interface.config
-        # se o kernel tiver um driver preso na interface (usbserial/option),
-        # o claim falha com EBUSY: tenta desanexar antes.
-        for detach in (
-            lambda: dev.is_kernel_driver_active(self.interface.number) and dev.detach_kernel_driver(self.interface.number),
-            lambda: dev.detach_kernel_driver(self.interface.number),
-            lambda: usb.util.dispose_resources(dev),
-        ):
-            try:
-                detach()
-                break
-            except Exception:
-                continue
+        try:
+            if dev.is_kernel_driver_active(self.interface.number):
+                dev.detach_kernel_driver(self.interface.number)
+                self._detached = True
+        except NotImplementedError:
+            pass
         try:
             usb.util.claim_interface(dev, self.interface.number)
         except usb.core.USBError as exc:
+            self.close()
             raise TransportError(f"claim falhou na interface {self.interface.number}: {exc}") from exc
         self._claimed = True
         for ep in self.interface.intf:
+            if usb.util.endpoint_type(ep.bmAttributes) != usb.util.ENDPOINT_TYPE_BULK:
+                continue
             if ep.bEndpointAddress & 0x80:
                 self._ep_in = ep
             else:
                 self._ep_out = ep
         if self._ep_in is None or self._ep_out is None:
+            self.close()
             raise TransportError("interface sem endpoints bulk IN/OUT")
         return self
 
@@ -102,6 +104,10 @@ class UsbTransport:
                 usb.util.release_interface(self.dev, self.interface.number)
         finally:
             self._claimed = False
+            if self._detached:
+                self.dev.attach_kernel_driver(self.interface.number)
+                self._detached = False
+            usb.util.dispose_resources(self.dev)
 
     def __enter__(self):
         return self.open()
@@ -116,37 +122,50 @@ class UsbTransport:
 
     def send_raw(self, header: bytes, data: bytes = b"") -> None:
         """Escreve cabeçalho e dados (transferências separadas, como o adbd)."""
-        self._ep_out.write(header, timeout=self.timeout_ms)
-        if data:
-            self._ep_out.write(data, timeout=self.timeout_ms)
+        try:
+            for part in (header, data):
+                if part and self._ep_out.write(part, timeout=self.timeout_ms) != len(part):
+                    raise TransportError("escrita USB incompleta")
+        except usb.core.USBError as exc:
+            raise TransportError(f"falha na escrita USB: {exc}") from exc
 
     def recv(self, timeout_ms: int | None = None) -> Message:
         """Lê um pacote completo (cabeçalho + dados)."""
         timeout = timeout_ms if timeout_ms is not None else self.timeout_ms
         deadline = time.monotonic() + timeout / 1000.0
-        header = self._read_exact(HEADER_SIZE, deadline)
-        command, arg0, arg1, length, _crc, _magic = decode_header(header)
-        data = self._read_exact(length, deadline) if length else b""
+        self._fill(HEADER_SIZE, deadline)
+        command, arg0, arg1, length, check, _magic = decode_header(bytes(self._rx[:HEADER_SIZE]))
+        from . import protocol
+        if length > protocol.MAX_PAYLOAD:
+            raise TransportError(f"payload USB excede o limite: {length}")
+        self._fill(HEADER_SIZE + length, deadline)
+        data = bytes(self._rx[HEADER_SIZE:HEADER_SIZE + length])
+        del self._rx[:HEADER_SIZE + length]
+        if not self.skip_checksum and (sum(data) & 0xFFFFFFFF) != check:
+            raise TransportError("checksum USB inválido")
         return Message(command, arg0, arg1, data)
 
-    def _read_exact(self, size: int, deadline: float) -> bytes:
-        buf = bytearray()
-        while len(buf) < size:
+    def _fill(self, size: int, deadline: float) -> None:
+        # Preserva cabeçalho/payload parcial entre timeouts e lê múltiplos do
+        # tamanho de pacote USB, sem perder bytes caso venham juntos.
+        while len(self._rx) < size:
             remaining = int((deadline - time.monotonic()) * 1000)
             if remaining <= 0:
-                raise TransportError(f"timeout lendo {size} bytes (faltam {size - len(buf)})")
+                raise TransportTimeout("timeout USB")
+            packet = self._ep_in.wMaxPacketSize
+            request = ((size - len(self._rx) + packet - 1) // packet) * packet
             try:
-                chunk = self._ep_in.read(size - len(buf), timeout=remaining)
+                chunk = self._ep_in.read(request, timeout=remaining)
             except usb.core.USBTimeoutError as exc:
-                raise TransportError("timeout USB") from exc
-            if not chunk:
-                raise TransportError("dispositivo fechou a conexão")
-            buf.extend(bytes(chunk))
-        return bytes(buf)
+                raise TransportTimeout("timeout USB") from exc
+            except usb.core.USBError as exc:
+                raise TransportError(f"falha na leitura USB: {exc}") from exc
+            # ZLP é possível no USB bulk e não equivale a EOF.
+            self._rx.extend(bytes(chunk))
 
 
 def find_interfaces(vids=KNOWN_VIDS) -> list[Interface]:
-    """Lista todas as interfaces ff/42/01 dos dispositivos conectados."""
+    """Lista as interfaces ff/42/01 e ff/48/01 dos dispositivos conectados."""
     found: list[Interface] = []
     for dev in usb.core.find(find_all=True, custom_match=lambda d: d.idVendor in vids):
         try:

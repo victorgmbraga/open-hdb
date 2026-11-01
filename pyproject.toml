@@ -4,11 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "open-hdb"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cliente HDB (Huawei Debug Bridge) aberto, derivado de engenharia reversa do hdbd"
+readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 dependencies = ["pyusb>=1.2"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+re = ["capstone>=5", "pyelftools>=0.30"]
+
+[project.urls]
+Repository = "https://github.com/victorgmbraga/open-hdb"
+
+[tool.setuptools.packages.find]
+include = ["openhdb*"]
 
 [project.scripts]
 openhdb = "openhdb.cli:main"

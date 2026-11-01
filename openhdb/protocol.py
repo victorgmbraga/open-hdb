@@ -9,7 +9,6 @@ Este módulo não tem dependências externas.
 from __future__ import annotations
 
 import struct
-import zlib
 from dataclasses import dataclass
 
 # --- comandos (mesmos valores do adb; ver docs/PROTOCOL.md §2) ---------------
@@ -54,7 +53,7 @@ AUTH_NAMES = {
 #: payload máximo que anunciamos/aceitamos (o adbd clássico usa 4096)
 MAX_PAYLOAD = 4096 * 64
 
-#: cabeçalho: command, arg0, arg1, data_length, data_crc32, magic
+#: Cabeçalho compartilhado ADB/HDB; data_check é soma de bytes, não CRC32.
 HEADER = struct.Struct("<6I")
 HEADER_SIZE = HEADER.size  # 24
 
@@ -72,17 +71,14 @@ class Message:
     def name(self) -> str:
         return COMMAND_NAMES.get(self.command, f"0x{self.command:08X}")
 
-    def encode(self, checksum: str = "crc32") -> tuple[bytes, bytes]:
-        """Retorna (cabeçalho, dados) prontos para escrita no transporte.
+    def encode(self, checksum: str = "sum") -> tuple[bytes, bytes]:
+        """Retorna (cabeçalho, dados). ADB clássico e HDB somam os bytes.
 
-        ``checksum``:
-          - ``"crc32"``: adb clássico
-          - ``"sum"``:   HDB (``calculate_apacket_checksum`` soma os bytes)
+        ``none`` só é válido após negociar ADB >= 0x01000001.
         """
-        if checksum == "sum":
-            crc = sum(self.data) & 0xFFFFFFFF if self.data else 0
-        else:
-            crc = zlib.crc32(self.data) & 0xFFFFFFFF if self.data else 0
+        if checksum not in ("sum", "none"):
+            raise ValueError(f"checksum desconhecido: {checksum!r}")
+        crc = sum(self.data) & 0xFFFFFFFF if checksum == "sum" else 0
         header = HEADER.pack(
             self.command,
             self.arg0,
@@ -114,15 +110,13 @@ def decode_header(header: bytes) -> tuple[int, int, int, int, int, int]:
 
 
 def parse_banner(banner: str) -> tuple[str, list[str]]:
-    """Divide um banner ``<tipo>::<feature>,<feature>,...`` (ver docs §3).
-
-    >>> parse_banner("hdb::shell_v2,cmd,stat_v2")
-    ('hdb', ['shell_v2', 'cmd', 'stat_v2'])
-    """
-    kind, _, rest = banner.partition("::")
-    features = [f for f in rest.split(",") if f]
-    return kind, features
+    """Lê ``device::ro.product.model=...;features=shell_v2,cmd``."""
+    kind, _, rest = banner.rstrip("\0").partition("::")
+    for prop in rest.split(";"):
+        if prop.startswith("features="):
+            return kind, [f for f in prop[len("features="):].split(",") if f]
+    return kind, []
 
 
 def make_banner(kind: str, features: list[str]) -> str:
-    return f"{kind}::" + ",".join(features)
+    return f"{kind}::features=" + ",".join(features) + ";\0"

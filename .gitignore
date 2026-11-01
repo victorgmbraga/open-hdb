@@ -1,6 +1,19 @@
-
-# bytecode/python
+# Python/build/test output
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
 *.egg-info/
+.pytest_cache/
+build/
+dist/
+.coverage
+
+# Local keys and proprietary/device artifacts: never publish
+*.pem
+*.key
+*.jks
+*.apk
+*.exe
+*.dll
+*.vdex
+hdbd

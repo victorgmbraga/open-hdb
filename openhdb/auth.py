@@ -1,9 +1,9 @@
-"""Autenticação HDB (derivada do adb, ver docs/PROTOCOL.md §4).
+"""Autorização USB HDB (derivada do ADB, ver docs/PROTOCOL.md §2).
 
 O dispositivo envia um ``A_AUTH``/``TOKEN`` com 20 bytes de nonce; respondemos
-com ``A_AUTH``/``SIGNATURE`` contendo a assinatura PKCS#1 v1.5 + SHA-1 desse
-nonce. Se a assinatura não for aceita, o dispositivo pede ``RSAPUBLICKEY`` e
-grava a chave em ``/data/misc/adb/hdb_keys`` (store separado do adb_keys).
+com ``A_AUTH``/``SIGNATURE`` contendo a assinatura PKCS#1 v1.5/SHA-1 prehashed.
+Se outro TOKEN chegar, enviamos ``RSAPUBLICKEY`` para aprovação manual no tablet.
+O store HDB é ``/data/misc/adb/hdb_keys``, separado de adb_keys.
 
 A chave privada é gerada/gerenciada pelo ``openssl`` (sem dependências Python).
 """
@@ -21,8 +21,8 @@ from pathlib import Path
 
 DEFAULT_KEY = Path.home() / ".config" / "open-hdb" / "hdbkey.pem"
 
-#: prefixo do DigestInfo de SHA-1 (PKCS#1 v1.5), usado só para documentação:
-#: o openssl já aplica o prefixo em ``dgst -sha1 -sign``.
+#: Prefixo DigestInfo de SHA-1 (PKCS#1 v1.5). O TOKEN já é um digest de
+#: 20 bytes: não deve ser passado por SHA-1 novamente.
 _SHA1_DIGESTINFO = bytes.fromhex("3021300906052b0e03021a05000414")
 
 
@@ -43,8 +43,13 @@ def ensure_key(path: Path = DEFAULT_KEY, bits: int = 2048) -> Path:
     if path.exists():
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
-    _run(["openssl", "genrsa", "-out", str(path), str(bits)])
-    path.chmod(0o600)
+    private = _run(["openssl", "genrsa", str(bits)])
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return path
+    with os.fdopen(fd, "wb") as output:
+        output.write(private)
     return path
 
 
@@ -63,8 +68,15 @@ def modulus_and_exponent(path: Path) -> tuple[int, int]:
 
 
 def sign_token(path: Path, token: bytes) -> bytes:
-    """Assina o nonce com PKCS#1 v1.5/SHA-1 (256 bytes para chave de 2048 bits)."""
-    return _run(["openssl", "dgst", "-sha1", "-sign", str(path)], data=token)
+    """Assina o TOKEN de 20 bytes como SHA-1 *prehashed* (RSA PKCS#1 v1.5).
+
+    ``RSA_verify(NID_sha1, token, 20, ...)`` no daemon compara diretamente o
+    token; ``openssl dgst -sha1 -sign`` estaria assinando SHA1(token).
+    """
+    if len(token) != 20:
+        raise AuthError(f"TOKEN precisa ter 20 bytes, recebeu {len(token)}")
+    return _run(["openssl", "pkeyutl", "-sign", "-inkey", str(path),
+                 "-pkeyopt", "rsa_padding_mode:pkcs1", "-pkeyopt", "digest:sha1"], data=token)
 
 
 def android_public_key(path: Path) -> bytes:
@@ -103,8 +115,8 @@ def fingerprint(path: Path) -> str:
 def encoded_public_key(path: Path, identity: str | None = None) -> bytes:
     """Formato que o dispositivo grava em ``hdb_keys``: ``base64 blob user@host``.
 
-    ``identity=""`` devolve só o base64 (o hdbd aceita; o framework então grava
-    uma linha sem identidade, que parece ser o formato que ele consegue reler).
+    ``identity=""`` devolve só o base64. Isso não resolve nem contorna a
+    autenticação adicional de serviços HDB.
     """
     blob = base64.b64encode(android_public_key(path))
     if identity == "":
