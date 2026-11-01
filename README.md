@@ -9,6 +9,7 @@ engenharia reversa do `hdbd` do dispositivo — sem HiSuite, sem Windows.
 > - ✅ descoberta da interface HDB (`ff/48/01`, ep `04`/`85`)
 > - ⚠️ handshake do HDB: pendente — `A_CNXN` faz o dispositivo re-enumerar;
 >   o HDB usa o vocabulário `HDB AUTHENTIC*` (ver docs/PROTOCOL.md §3.1)
+> - ✅ **cabeçalho real do HDB decodificado: 36 bytes** (`openhdb/protocol_hdb.py`)
 > - ⏳ `install` pelo caminho `pm install --hwhdb`
 >
 > Evidências em [docs/PROTOCOL.md](docs/PROTOCOL.md).

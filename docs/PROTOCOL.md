@@ -58,6 +58,50 @@ Constantes (valores do ADB, herdados pelo fork):
 
 (Os valores são o ASCII — `"CNXN"`, `"OPEN"`... — lido como `uint32` little-endian.)
 
+## 2.1 Cabeçalho real do HDB: 36 bytes (não 24)
+
+Desmontando `hdbd` (Thumb, símbolos não removidos) o layout do `apacket` do HDB
+é **maior** que o do adb:
+
+```
+offset  tamanho  campo
+0x00    4        prefixo de quadro (read_packet/write_packet tratam separado)
+0x04    4        desconhecido
+0x08    4        desconhecido
+0x0c    4        command
+0x10    4        arg0
+0x14    4        arg1
+0x18    4        data_length
+0x1c    4        data_check   (calculate_apacket_checksum)
+0x20    4        magic        (= ~command)
+0x24    ...      data
+```
+
+Evidências (endereços no binário do KOB2-W09):
+
+| função | instruções |
+|---|---|
+| `check_header` @0x59445 | `ldr r0,[r6,#0xc]` / `ldr r1,[r6,#0x20]` / `mvns r0,r0; cmp r1,r0` / `ldr r0,[r5,#0xa0]` (max_payload) / `ldr r1,[r6,#0x18]` |
+| `send_packet` @0x57fd1 | `ldr r0,[r5,#0xc]; mvns r0,r0; str r0,[r5,#0x20]` e `str r0,[r5,#0x1c]` (checksum) |
+| `handle_packet` @0x50659 | lê comando de `[r4,#0xc]`, compara com `0x48545541` (A_AUTH) e `0x4e45504f` (A_OPEN), payload em `r4+0x24` |
+| `check_data` @0x59575 | compara `calculate_apacket_checksum` com `[r4,#0x1c]` |
+
+Implementação: `openhdb/protocol_hdb.py` (`HdbMessage`), com testes em
+`tests/test_protocol.py`.
+
+### Resultado empírico das tentativas de handshake
+
+| tentativa na interface `ff/48/01` | resultado |
+|---|---|
+| leitura passiva (sem escrever) | timeout (dispositivo não fala primeiro) |
+| texto puro `HDB AUTHENTICPCIDENT\n` | aceito, sem resposta |
+| APACKET de 24 bytes (`A_CNXN`, `A_AUTH`…) | **EIO** + re-enumeração do USB |
+| prefixo 4B + cabeçalho 36B (`A_CNXN`, `A_AUTH`+texto), prefixo ∈ {0,1,0x24,'HDBS','HDSH'} | **EIO** + re-enumeração |
+
+Conclusão: o `hdbd` rejeita o quadro antes de qualquer autenticação — falta
+descobrir a semântica do prefixo de 4 bytes (ou um passo de inicialização
+anterior a ele).
+
 ## 3. Banner
 
 Formato confirmado pelas strings `%s::%s`, `features=%s`, `parse_banner: %s`:
@@ -191,6 +235,8 @@ Interface do HDB **a identificar** — o `probe` reporta todas as interfaces com
 ## 7. Aberto
 
 - [x] qual interface USB pertence ao `hdbd` (itf ff/48/01, ep 04/85)
+- [ ] semântica do prefixo de 4 bytes do quadro HDB
+- [ ] **capturar uma sessão real do HiSuite com usbmon** (caminho decisivo)
 - [ ] formato das mensagens `HDB AUTHENTIC*` (texto puro? A_AUTH com payload?)
 - [ ] se o handshake do HDB começa com um magic/hello diferente de A_CNXN
 - [ ] valor do tipo no banner (`hdb` vs `device`) e lista de features (o HDB não aceita CNXN, logo o banner vem por outro caminho)
