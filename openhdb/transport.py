@@ -72,9 +72,11 @@ class HdbConnection:
     """Conecta, autentica e multiplexa streams sobre um transporte USB."""
 
     def __init__(self, transport: UsbTransport, key_path: Path | None = None, verbose: bool = False,
-                 checksum: str = "crc32"):
+                 checksum: str = "crc32", approve=None):
         self.transport = transport
         self.checksum = checksum
+        self.approve = approve  # callable(fingerprint) -> None, para aprovar sem UI
+        self._last_approve = 0.0
         self.key_path = auth.ensure_key(key_path or auth.DEFAULT_KEY)
         self.verbose = verbose
         self.banner: str | None = None
@@ -120,17 +122,8 @@ class HdbConnection:
         sent_key = False
         last_cnxn = time.monotonic()
         while time.monotonic() < deadline:
-            # reenvia CNXN a cada 5 s: força o hdbd a recarregar as chaves
-            if time.monotonic() - last_cnxn > 5.0 and not self.online:
-                self.send(
-                    Message(
-                        protocol.A_CNXN,
-                        protocol.A_VERSION,
-                        protocol.MAX_PAYLOAD,
-                        protocol.make_banner("host", HOST_FEATURES).encode(),
-                    )
-                )
-                last_cnxn = time.monotonic()
+            # (sem reenvio de CNXN: reenviar faz o USB re-enumerar e derruba o ADB,
+            #  que é quem toca o diálogo de aprovação)
             try:
                 msg = self.recv(timeout=min(3.0, max(0.2, deadline - time.monotonic())))
             except TransportError:
@@ -181,13 +174,19 @@ class HdbConnection:
             self.send(Message(protocol.A_AUTH, protocol.AUTH_SIGNATURE, 0, signature))
             return
         if msg.arg0 == protocol.AUTH_RSAPUBLICKEY:
-            if already_sent_key:
-                raise ConnectionError_(
-                    "chave recusada duas vezes: remova a autorização antiga no tablet "
-                    "ou desligue a depuração USB/HDB e repita"
-                )
             key = auth.encoded_public_key(self.key_path)
             self.send(Message(protocol.A_AUTH, protocol.AUTH_RSAPUBLICKEY, 0, key + b"\0"))
+            # modo one-shot: aprova sozinho pelo fingerprint (como o HiSuite)
+            if self.approve:
+                import time as _t
+
+                if _t.monotonic() - self._last_approve > 2.0:
+                    self._last_approve = _t.monotonic()
+                    try:
+                        self.approve(auth.fingerprint(self.key_path))
+                    except Exception as exc:  # noqa: BLE001
+                        if self.verbose:
+                            print(f"  (aprovação automática falhou: {exc})")
             return
         raise ConnectionError_(f"A_AUTH desconhecido: arg0={msg.arg0}")
 

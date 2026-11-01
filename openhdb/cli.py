@@ -34,14 +34,14 @@ def cmd_probe(args) -> int:
 
 
 def cmd_shell(args) -> int:
-    with client.connect(verbose=args.verbose) as conn:
+    with client.connect(verbose=args.verbose, approve=not args.no_approve, serial=args.serial) as conn:
         hdb = client.Hdb(conn)
         sys.stdout.write(hdb.shell(args.command).decode(errors="replace"))
     return 0
 
 
 def cmd_banner(args) -> int:
-    with client.connect(verbose=args.verbose) as conn:
+    with client.connect(verbose=args.verbose, approve=not args.no_approve, serial=args.serial) as conn:
         hdb = client.Hdb(conn)
         print("banner :", hdb.banner())
         print("tipo   :", conn.kind)
@@ -52,7 +52,7 @@ def cmd_banner(args) -> int:
 
 
 def cmd_install(args) -> int:
-    with client.connect(verbose=args.verbose) as conn:
+    with client.connect(verbose=args.verbose, approve=not args.no_approve, serial=args.serial) as conn:
         hdb = client.Hdb(conn)
         print(hdb.install(Path(args.apk)))
     return 0
@@ -60,26 +60,39 @@ def cmd_install(args) -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="openhdb", description="cliente HDB aberto")
-    ap.add_argument("-v", "--verbose", action="store_true", help="mostra o tráfego de pacotes")
+    # opções comuns aceitas antes ou depois do subcomando
+    comum = argparse.ArgumentParser(add_help=False)
+    comum.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS,
+                       help="mostra o tráfego de pacotes")
+    comum.add_argument("-s", "--serial", default=argparse.SUPPRESS,
+                       help="serial do dispositivo para a aprovação via ADB")
+    comum.add_argument("--no-approve", action="store_true", default=argparse.SUPPRESS,
+                       help="não aprovar automaticamente (mostra o diálogo)")
+    ap.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS)
+    ap.add_argument("-s", "--serial", default=argparse.SUPPRESS)
+    ap.add_argument("--no-approve", action="store_true", default=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("probe", help="lista interfaces e lê o banner")
+    p = sub.add_parser("probe", parents=[comum], help="lista interfaces e lê o banner")
     p.add_argument("--timeout", type=float, default=3.0)
     p.add_argument("--force", action="store_true", help="escreve CNXN também na interface HDB (pode resetar o USB)")
     p.set_defaults(func=cmd_probe)
 
-    p = sub.add_parser("banner", help="mostra banner/versão/features")
+    p = sub.add_parser("banner", parents=[comum], help="mostra banner/versão/features")
     p.set_defaults(func=cmd_banner)
 
-    p = sub.add_parser("shell", help="executa um comando no dispositivo")
+    p = sub.add_parser("shell", parents=[comum], help="executa um comando no dispositivo")
     p.add_argument("command")
     p.set_defaults(func=cmd_shell)
 
-    p = sub.add_parser("install", help="instala um APK pelo caminho do HDB")
+    p = sub.add_parser("install", parents=[comum], help="instala um APK pelo caminho do HDB")
     p.add_argument("apk")
     p.set_defaults(func=cmd_install)
 
     args = ap.parse_args(argv)
+    for attr, default in (("verbose", False), ("serial", None), ("no_approve", False)):
+        if not hasattr(args, attr):
+            setattr(args, attr, default)
     return args.func(args)
 
 

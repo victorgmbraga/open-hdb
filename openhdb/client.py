@@ -6,7 +6,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import protocol
+import subprocess
+
+from . import auth, protocol
 from .transport import HdbConnection
 from .usb import Interface, TransportError, UsbTransport, find_interfaces
 
@@ -58,8 +60,85 @@ def probe(timeout: float = 3.0, verbose: bool = False) -> list[ProbeResult]:
     return results
 
 
+def _adb(serial: str | None, *args: str) -> subprocess.CompletedProcess:
+    cmd = ["adb"]
+    if serial:
+        cmd += ["-s", serial]
+    cmd += list(args)
+    return subprocess.run(cmd, capture_output=True, timeout=20)
+
+
+def adb_approve_dialog(serial: str | None = None, timeout: float = 8.0) -> bool:
+    """Aceita o diálogo "Permitir conexão via HDB?" tocando em OK via uiautomator.
+
+    É o caminho que funciona de fato: o ``service call`` não entrega o argumento
+    (marshal do AIDL), então automatizamos o toque.
+    """
+    import tempfile
+    import time as _t
+    import xml.etree.ElementTree as ET
+
+    end = _t.monotonic() + timeout
+    while _t.monotonic() < end:
+        _adb(serial, "shell", "uiautomator", "dump", "/sdcard/openhdb_ui.xml")
+        with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
+            path = tmp.name
+        _adb(serial, "pull", "/sdcard/openhdb_ui.xml", path)
+        try:
+            root = ET.parse(path).getroot()
+        except Exception:
+            _t.sleep(0.8)
+            continue
+        ok = None
+        for node in root.iter("node"):
+            text = (node.get("text") or "").strip().upper()
+            if text in ("OK", "PERMITIR", "ALLOW") and node.get("clickable") == "true":
+                ok = node.get("bounds")
+                break
+        if ok:
+            x1, y1, x2, y2 = (int(v) for v in ok.replace("][", ",").strip("[]").split(","))
+            _adb(serial, "shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2))
+            _adb(serial, "shell", "rm", "-f", "/sdcard/openhdb_ui.xml")
+            return True
+        _t.sleep(0.8)
+    # fallback: coordenadas proporcionais do diálogo HwUsbDebuggingActivity
+    size = _adb(serial, "shell", "wm", "size").stdout.decode(errors="replace")
+    try:
+        w, h = (int(v) for v in size.split(":")[-1].strip().split("x"))
+    except Exception:
+        return False
+    _adb(serial, "shell", "input", "tap", str(w // 2), str(int(h * 0.60)))   # "Sempre permita"
+    _adb(serial, "shell", "input", "tap", str(int(w * 0.65)), str(int(h * 0.67)))  # OK
+    return True
+
+
+def adb_approve(fingerprint: str, serial: str | None = None) -> None:
+    """Aprova a chave pendente sem tocar na tela (``hwUsbExService.allowUsbHDB``).
+
+    É o que o HiSuite faz depois que o usuário aceita o diálogo; aqui chamamos
+    o serviço Binder direto pelo ADB, usando o fingerprint da chave.
+    """
+    cmd = ["adb"]
+    if serial:
+        cmd += ["-s", serial]
+    cmd += ["shell", "service", "call", "hwUsbExService", "1", "s16", fingerprint]
+    subprocess.run(cmd, capture_output=True, timeout=15)
+    # fallback: toca o diálogo (o service call não faz o marshal da string)
+    adb_approve_dialog(serial)
+
+
+def clear_keys(serial: str | None = None) -> None:
+    """Apaga o store de chaves do HDB (``hwUsbExService.clearUsbHDBKeys``)."""
+    cmd = ["adb"]
+    if serial:
+        cmd += ["-s", serial]
+    cmd += ["shell", "service", "call", "hwUsbExService", "3", "s16", "x"]
+    subprocess.run(cmd, capture_output=True, timeout=15)
+
+
 def connect(interface: Interface | None = None, key_path: Path | None = None,
-            verbose: bool = False, auth_timeout: float = 20.0) -> HdbConnection:
+            verbose: bool = False, auth_timeout: float = 20.0,
+            approve: bool = True, serial: str | None = None) -> HdbConnection:
     """Conecta e autentica na primeira interface que responder, ou na indicada."""
     candidates = [interface] if interface else find_interfaces()
     if not candidates:
@@ -73,7 +152,9 @@ def connect(interface: Interface | None = None, key_path: Path | None = None,
             continue
         from .usb import HDB_SUBCLASS
         mode = "sum" if intf.intf.bInterfaceSubClass == HDB_SUBCLASS else "crc32"
-        conn = HdbConnection(transport, key_path=key_path, verbose=verbose, checksum=mode)
+        approver = (lambda fp: adb_approve(fp, serial)) if approve else None
+        conn = HdbConnection(transport, key_path=key_path, verbose=verbose, checksum=mode,
+                             approve=approver)
         try:
             conn.connect(timeout=auth_timeout)
             return conn

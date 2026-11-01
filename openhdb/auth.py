@@ -11,6 +11,7 @@ A chave privada é gerada/gerenciada pelo ``openssl`` (sem dependências Python)
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import re
 import socket
@@ -91,6 +92,12 @@ def android_public_key(path: Path) -> bytes:
     blob += struct.pack("<I", exponent)
     assert len(blob) == 4 + 4 + 256 + 256 + 4
     return blob
+
+
+def fingerprint(path: Path) -> str:
+    """Fingerprint MD5 da chave, no formato do Android (``AA:BB:...``)."""
+    digest = hashlib.md5(android_public_key(path)).hexdigest().upper()
+    return ":".join(digest[i : i + 2] for i in range(0, 32, 2))
 
 
 def encoded_public_key(path: Path, identity: str | None = None) -> bytes:
