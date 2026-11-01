@@ -97,6 +97,14 @@ Implementação: `openhdb/protocol_hdb.py` (`HdbMessage`), com testes em
 | texto puro `HDB AUTHENTICPCIDENT\n` | aceito, sem resposta |
 | APACKET de 24 bytes (`A_CNXN`, `A_AUTH`…) | **EIO** + re-enumeração do USB |
 | prefixo 4B + cabeçalho 36B (`A_CNXN`, `A_AUTH`+texto), prefixo ∈ {0,1,0x24,'HDBS','HDSH'} | **EIO** + re-enumeração |
+| prefixo = tamanho total do quadro | EIO + re-enumeração |
+| quadro completo de 512 bytes (padding) | EIO + re-enumeração |
+| escrita em 2 partes (4B, depois 36B) | EIO + re-enumeração |
+| **ler a interface nova após a re-enumeração** | timeout — não há resposta pendente |
+
+Detalhe importante: nos últimos testes o `write` foi **aceito** e o `EIO` veio da
+`read` — é o handle antigo morrendo com a re-enumeração, não uma rejeição do
+write. Mesmo assim, a interface nova não traz dados, então a sessão não continua.
 
 Conclusão: o `hdbd` rejeita o quadro antes de qualquer autenticação — falta
 descobrir a semântica do prefixo de 4 bytes (ou um passo de inicialização
