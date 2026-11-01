@@ -160,8 +160,6 @@ def find_interfaces(vids=KNOWN_VIDS) -> list[Interface]:
                 and intf.bInterfaceProtocol == PROTOCOL
             ):
                 found.append(Interface(dev, cfg, intf))
-    # HDB (0x48) primeiro: é o alvo deste cliente; ADB (0x42) como alternativa
-    found.sort(key=lambda i: 0 if i.intf.bInterfaceSubClass == HDB_SUBCLASS else 1)
     return found
 
 

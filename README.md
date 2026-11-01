@@ -37,9 +37,28 @@ backup/restore de dados de aplicativo.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install pyusb
-adb kill-server                  # o servidor do adb disputa a interface USB
-sudo .venv/bin/python -m openhdb probe      # lista interfaces e lê o banner
-.venv/bin/python -m openhdb shell 'getprop ro.product.model'
+
+.venv/bin/python -m openhdb probe                  # lista interfaces
+.venv/bin/python -m openhdb shell 'id'             # shell
+.venv/bin/python -m openhdb install app.apk        # instala
+.venv/bin/python -m openhdb --kind hdb banner      # transporte HDB
+```
+
+Não é necessário `adb` instalado. Se o `adb server` estiver rodando, ele disputa
+a interface ADB — pare-o (`adb kill-server`) ou use `--kind hdb`.
+
+Na primeira conexão o tablet mostra **"Permitir depuração USB?"** (ADB) ou
+**"Permitir conexão via HDB?"** — aprove manualmente; a chave fica autorizada.
+
+### Exemplo real (neste tablet, sem adb)
+
+```
+$ python -m openhdb shell "id; getprop ro.product.model"
+uid=2000(shell) ... context=u:r:shell:s0
+KOB2-W09
+$ python -m openhdb install hello.apk
+Success
+$ python -m openhdb pull /data/local/tmp/t.txt ./t.txt
 ```
 
 ## Estrutura

@@ -76,6 +76,7 @@ class HdbConnection:
         self.transport = transport
         self.checksum = checksum
         self.approve = approve  # callable(fingerprint) -> None, para aprovar sem UI
+        self.is_hdb = checksum == "sum"
         self._last_approve = 0.0
         self.key_path = auth.ensure_key(key_path or auth.DEFAULT_KEY)
         self.verbose = verbose

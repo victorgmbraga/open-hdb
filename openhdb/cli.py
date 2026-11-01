@@ -34,14 +34,14 @@ def cmd_probe(args) -> int:
 
 
 def cmd_shell(args) -> int:
-    with client.connect(verbose=args.verbose, approve=not args.no_approve, serial=args.serial) as conn:
+    with client.connect(verbose=args.verbose, approve=bool(getattr(args, "auto_approve", False)), serial=args.serial, kind=args.kind) as conn:
         hdb = client.Hdb(conn)
         sys.stdout.write(hdb.shell(args.command).decode(errors="replace"))
     return 0
 
 
 def cmd_banner(args) -> int:
-    with client.connect(verbose=args.verbose, approve=not args.no_approve, serial=args.serial) as conn:
+    with client.connect(verbose=args.verbose, approve=bool(getattr(args, "auto_approve", False)), serial=args.serial, kind=args.kind) as conn:
         hdb = client.Hdb(conn)
         print("banner :", hdb.banner())
         print("tipo   :", conn.kind)
@@ -52,7 +52,7 @@ def cmd_banner(args) -> int:
 
 
 def cmd_install(args) -> int:
-    with client.connect(verbose=args.verbose, approve=not args.no_approve, serial=args.serial) as conn:
+    with client.connect(verbose=args.verbose, approve=bool(getattr(args, "auto_approve", False)), serial=args.serial, kind=args.kind) as conn:
         hdb = client.Hdb(conn)
         print(hdb.install(Path(args.apk)))
     return 0
@@ -66,10 +66,16 @@ def main(argv=None) -> int:
                        help="mostra o tráfego de pacotes")
     comum.add_argument("-s", "--serial", default=argparse.SUPPRESS,
                        help="serial do dispositivo para a aprovação via ADB")
+    comum.add_argument("--kind", choices=("auto", "adb", "hdb"), default=argparse.SUPPRESS,
+                       help="transporte: adb (padrão, funciona), hdb (experimental) ou auto")
+    comum.add_argument("--auto-approve", action="store_true", default=argparse.SUPPRESS,
+                       help="aprova o diálogo sozinho via ADB (padrão: você aperta OK no tablet)")
     comum.add_argument("--no-approve", action="store_true", default=argparse.SUPPRESS,
-                       help="não aprovar automaticamente (mostra o diálogo)")
+                       help="(compat) idem ao padrão: não automatiza")
     ap.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS)
     ap.add_argument("-s", "--serial", default=argparse.SUPPRESS)
+    ap.add_argument("--kind", choices=("auto", "adb", "hdb"), default=argparse.SUPPRESS)
+    ap.add_argument("--auto-approve", action="store_true", default=argparse.SUPPRESS)
     ap.add_argument("--no-approve", action="store_true", default=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -90,7 +96,7 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_install)
 
     args = ap.parse_args(argv)
-    for attr, default in (("verbose", False), ("serial", None), ("no_approve", False)):
+    for attr, default in (("verbose", False), ("serial", None), ("auto_approve", False), ("kind", "auto")):
         if not hasattr(args, attr):
             setattr(args, attr, default)
     return args.func(args)

@@ -138,29 +138,40 @@ def clear_keys(serial: str | None = None) -> None:
 
 def connect(interface: Interface | None = None, key_path: Path | None = None,
             verbose: bool = False, auth_timeout: float = 20.0,
-            approve: bool = True, serial: str | None = None) -> HdbConnection:
+            approve: bool = False, serial: str | None = None,
+            kind: str = "auto") -> HdbConnection:
     """Conecta e autentica na primeira interface que responder, ou na indicada."""
     candidates = [interface] if interface else find_interfaces()
+    if kind == "adb":
+        candidates = [i for i in candidates if i.intf.bInterfaceSubClass == 0x42]
+    elif kind == "hdb":
+        candidates = [i for i in candidates if i.intf.bInterfaceSubClass == 0x48]
+    else:  # auto: ADB primeiro (é o canal que funciona de ponta a ponta)
+        candidates.sort(key=lambda i: 0 if i.intf.bInterfaceSubClass == 0x42 else 1)
     if not candidates:
         raise TransportError("nenhuma interface ADB/HDB encontrada (cabo? settings system hdb_enabled?)")
     last: Exception | None = None
-    for intf in candidates:
-        try:
-            transport = UsbTransport(intf).open()
-        except Exception as exc:
-            last = exc
-            continue
-        from .usb import HDB_SUBCLASS
-        mode = "sum" if intf.intf.bInterfaceSubClass == HDB_SUBCLASS else "crc32"
-        approver = (lambda fp: adb_approve(fp, serial)) if approve else None
-        conn = HdbConnection(transport, key_path=key_path, verbose=verbose, checksum=mode,
-                             approve=approver)
-        try:
-            conn.connect(timeout=auth_timeout)
-            return conn
-        except Exception as exc:
-            last = exc
-            conn.transport.close()
+    for tentativa in range(3):
+        for intf in candidates:
+            try:
+                transport = UsbTransport(intf).open()
+            except Exception as exc:
+                last = exc
+                continue
+            from .usb import HDB_SUBCLASS
+            mode = "sum" if intf.intf.bInterfaceSubClass == HDB_SUBCLASS else "crc32"
+            approver = (lambda fp: adb_approve(fp, serial)) if approve else None
+            conn = HdbConnection(transport, key_path=key_path, verbose=verbose, checksum=mode,
+                                 approve=approver)
+            try:
+                conn.connect(timeout=auth_timeout)
+                return conn
+            except Exception as exc:
+                last = exc
+                conn.transport.close()
+        import time as _t
+
+        _t.sleep(1.5)  # dá tempo do adbd liberar o transporte anterior
     raise TransportError(f"não consegui conectar: {last}")
 
 
@@ -197,6 +208,17 @@ class Hdb:
         if size != len(data):
             raise TransportError(f"upload incompleto: {size} de {len(data)} bytes")
 
+    def pull(self, remote: str, local: Path, timeout: float = 120.0) -> Path:
+        """Baixa um arquivo usando ``base64`` no shell (sem o serviço sync)."""
+        import base64 as _b64
+
+        out = self.shell(f"base64 {remote}", timeout=timeout)
+        if not out.strip():
+            raise TransportError(f"arquivo vazio ou inexistente: {remote}")
+        data = _b64.b64decode(b"".join(out.split()))
+        Path(local).write_bytes(data)
+        return Path(local)
+
     def install(self, apk: Path) -> str:
         """Instala um APK pelo caminho do HDB.
 
@@ -207,7 +229,11 @@ class Hdb:
         apk = Path(apk)
         remote = f"/data/local/tmp/{apk.name}"
         self.push(apk, remote)
-        out = self.shell(f"pm install --hwhdb {apk.stat().st_size} {remote}")
+        if self.conn.is_hdb:
+            # caminho do hdbd: exige verificação Huawei (INSTALL_HDB_VERIFY_FAILED)
+            out = self.shell(f"pm install --hwhdb {apk.stat().st_size} {remote}")
+        else:
+            out = self.shell(f"pm install -r {remote}")
         self.shell(f"rm -f {remote}")
         return out.decode(errors="replace").strip()
 
